@@ -70,6 +70,9 @@ configs/
 *.md
 *.txt
 
+# Scripts
+*.sh
+
 # Temporary files
 *.tmp
 *.log
