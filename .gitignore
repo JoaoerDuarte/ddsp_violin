@@ -1,0 +1,71 @@
+# Data and Preprocessed Files
+preprocessed/
+dataset/
+datasets/
+*.npy
+
+# Model Checkpoints and Weights
+*.pt
+*.pth
+*.ckpt
+*.npz
+model_parameters/
+checkpoints/
+
+# Training Outputs and Logs
+runs/
+logs/
+wandb/
+outputs/
+events.out.tfevents*
+
+# Generated Audio and Visualizations
+plots/
+plots_ir/
+*.wav
+*.mp3
+*.flac
+
+# Impulse Responses (if large/generated)
+normalized_irs/
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+
+# Configs (optional - uncomment if you want to ignore specific configs)
+configs/
+
+# Temporary files
+*.tmp
+*.log
+*.cache
