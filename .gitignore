@@ -32,6 +32,7 @@ normalized_irs/
 # Jupyter Notebooks
 .ipynb_checkpoints/
 */.ipynb_checkpoints/
+*.ipynb
 
 # Python
 __pycache__/
@@ -64,6 +65,10 @@ Thumbs.db
 
 # Configs (optional - uncomment if you want to ignore specific configs)
 configs/
+
+# Documentation and Notes
+*.md
+*.txt
 
 # Temporary files
 *.tmp
