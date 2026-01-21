@@ -1,0 +1,116 @@
+train:
+  name: test
+  root: runs/
+  steps: 100
+  batch_size: 8
+  loss_window: 100
+  save_audio_steps: [10, 20, 50, 75]
+  save_audio_num_comparisons: 3
+  gradient_clip_norm: 3.0
+  learning_rate: 0.001
+  lr_decay_steps: 10000
+  lr_decay_rate: 0.98
+  lr_staircase: false
+  svl_activation_threshold: 1000.0
+  dataloader_num_workers: 4
+  dataloader_pin_memory: true
+  preprocessed_data_dir: preprocessed
+
+preprocess:
+  out_dir: preprocessed/physical_model/new/convolved_Bernardel_ear_norm/A
+  sampling_rate: 16000
+  block_size: 64
+  signal_length: 64000
+  oneshot: false
+  crepe_model_path: ''
+
+data:
+  data_location: dataset/physical_model/new/convolved_Bernardel_ear_norm/A
+  extension: wav
+  dataset_name: physical_model/new/convolved_Bernardel_ear_norm/A
+
+model:
+  sampling_rate: 16000
+  block_size: 64
+  signal_length: 64000
+  use_inharmonicity: false
+
+  encoder:
+    use_encoder: true
+    rnn_channels: 512
+    z_dims: 16
+    z_time_steps: 125
+    mfcc:
+      n_mfcc: 30
+      n_mels: 128
+      f_min: 20.0
+      f_max: 8000.0
+      log_mels: true
+
+  decoder:
+    n_harmonic: 60
+    n_bands: 65
+    rnn_channels: 512
+    ch: 512
+    layers_per_stack: 3
+    noise_bias: -5.0
+
+  helmholtz:
+    use_helmholtz_synthesis: true
+    "β_min": 0.05
+    "β_max": 0.5
+    "α_min": -1.0
+    "α_max": 1.0
+    notch_width: 0.05
+    n_residuals: 10
+    residual_scale: 1.0
+    inharmonicity_b_max: 0.0005
+
+  use_resonance: true
+  resonance_type: convolutional
+  resonance_length: 2048
+  resonance_add_dry: false
+  resonance_mask_ir: false
+  resonance_position: before_noise
+  resonance_normalization_type: None
+  resonance_psd_prior: pink
+  resonance_n_fft: 2048
+  resonance_psd_ema_alpha: 0.99
+
+  use_room: false
+  room_type: ar
+  room_window_size: 4096
+  room_ar_order: 16
+  room_add_dry: true
+  room_max_reflection: 0.999
+  room_normalization_type: rms
+
+loss:
+  mssl:
+    scales: [2048, 1024, 512, 256, 128, 64]
+    overlap: 0.75
+
+  use_source_variance: false
+  source_variance:
+    weight: 0.0
+    loudness_threshold: 0.2
+    pitch_threshold: 50.0
+    distribution_type: var
+    power_type: pwr
+    per_pitch: false
+    normalize_metrics: true
+    epsilon: 1.0e-08
+    n_harmonics: 10
+
+  use_helmholtz_deviation_loss: true
+  violin_physics:
+    weight: 10.0
+    smoothness_β: 0.0
+    smoothness_α: 0.0
+    smoothness_γ: 0.0
+    smoothness_B: 0.0
+    residual_magnitude: 1.0
+    residual_loss_type: l2
+    use_activation_filter: true
+    loudness_threshold: 0.2
+    pitch_threshold: 20.0

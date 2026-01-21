@@ -1,0 +1,2973 @@
+
+--- ./preprocess.py ---
+
+import os
+import warnings
+import pathlib
+import numpy as np
+import yaml
+import librosa as li
+import torch
+from tqdm import tqdm
+from os import makedirs, path
+from effortless_config import Config
+from ddsp_torch.core import extract_loudness, extract_pitch
+
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+os.environ['METAL_DEVICE_WRITABLE_SHARED'] = '0'
+warnings.filterwarnings('ignore', message='.*divide by zero.*')
+
+
+def get_files(data_location, extension, **kwargs):
+    print(f"\nSearching for files in: {data_location}")
+    print(f"File extension: {extension}")
+    files = sorted(list(pathlib.Path(data_location).rglob(f"*.{extension}")))
+    print("\nFiles found in order of processing:")
+    print("==================================")
+    for i, file_path in enumerate(files, 1):
+        print(f"{i}. {file_path}")
+    print(f"\nTotal files found: {len(files)}")
+    print("==================================\n")
+    return files
+
+
+def _nan_inf_safe(x, fill=0.0):
+    if x is None:
+        return None
+    return np.nan_to_num(np.asarray(x), nan=fill, posinf=fill, neginf=fill)
+
+
+def _align_to_length(x, required):
+    x = np.asarray(x).reshape(-1)
+    cur = x.shape[0]
+    if cur == required:
+        return x.astype(np.float32, copy=False)
+    if cur > required:
+        excess = cur - required
+        if excess == 1:
+            x = x[:-1]
+        else:
+            a = excess // 2
+            b = excess - a
+            x = x[a:cur - b]
+    else:
+        if cur == 0:
+            x = np.zeros(required, dtype=np.float32)
+        else:
+            x = np.pad(x, (0, required - cur), mode='edge')
+    return x.astype(np.float32, copy=False)
+
+
+def preprocess_audio_file(file_path, sampling_rate, block_size, signal_length,
+                          oneshot, crepe_model_path="", **kwargs):
+    audio, _ = li.load(file_path, sr=sampling_rate)
+
+    pad = (signal_length - len(audio) % signal_length) % signal_length
+    if pad:
+        audio = np.pad(audio, (0, pad))
+
+    if oneshot:
+        audio = audio[..., :signal_length]
+
+    pitch = extract_pitch(audio, sampling_rate, block_size, crepe_model_path)
+    loudness = extract_loudness(audio, sampling_rate, block_size)
+
+    pitch = _nan_inf_safe(pitch, 0.0)
+    loudness = np.nan_to_num(np.asarray(loudness), nan=-120.0, posinf=-120.0, neginf=-120.0)
+
+    n_segments = audio.shape[0] // signal_length
+    frames_per_segment = signal_length // block_size
+    required_total = n_segments * frames_per_segment
+
+    pitch = _align_to_length(pitch, required_total)
+    loudness = _align_to_length(loudness, required_total)
+
+    audio_segments = audio.reshape(n_segments, signal_length).astype(np.float32, copy=False)
+    pitch_segments = pitch.reshape(n_segments, frames_per_segment)
+    loudness_segments = loudness.reshape(n_segments, frames_per_segment)
+
+    return audio_segments, pitch_segments, loudness_segments
+
+
+class Dataset(torch.utils.data.Dataset):
+    def __init__(self, data_dir):
+        super().__init__()
+        self.signals = np.load(path.join(data_dir, "signals.npy"))
+        self.pitches = np.load(path.join(data_dir, "pitches.npy"))
+        self.loudness = np.load(path.join(data_dir, "loudness.npy"))
+
+    def __len__(self):
+        return self.signals.shape[0]
+
+    def __getitem__(self, idx):
+        signal = torch.from_numpy(self.signals[idx])
+        pitch = torch.from_numpy(self.pitches[idx])
+        loud = torch.from_numpy(self.loudness[idx])
+        return signal, pitch, loud
+
+
+def load_config(config_arg):
+    if config_arg is None:
+        config_path = "config.yaml"
+    else:
+        config_path = f"configs/{config_arg}.yaml"
+    with open(config_path, "r") as f:
+        return yaml.safe_load(f)
+
+
+def process_all_files(files, preprocess_config):
+    progress_bar = tqdm(files)
+    all_signals, all_pitches, all_loudness = [], [], []
+    total_segments = 0
+
+    for file_path in progress_bar:
+        progress_bar.set_description(str(file_path))
+        try:
+            signals, pitches, loudness = preprocess_audio_file(file_path, **preprocess_config)
+        except Exception as e:
+            print(f"\nError processing {file_path}: {e}")
+            continue
+        all_signals.append(signals)
+        all_pitches.append(pitches)
+        all_loudness.append(loudness)
+        total_segments += len(signals)
+
+    return all_signals, all_pitches, all_loudness, total_segments
+
+
+def save_preprocessed_data(signals_list, pitches_list, loudness_list, output_dir):
+    signals = np.concatenate(signals_list, 0).astype(np.float32)
+    pitches = np.concatenate(pitches_list, 0).astype(np.float32)
+    loudness = np.concatenate(loudness_list, 0).astype(np.float32)
+
+    makedirs(output_dir, exist_ok=True)
+    np.save(path.join(output_dir, "signals.npy"), signals)
+    np.save(path.join(output_dir, "pitches.npy"), pitches)
+    np.save(path.join(output_dir, "loudness.npy"), loudness)
+
+    print(f"\nSaved {len(signals)} segments to {output_dir}")
+    print(f"Shapes — pitch {pitches.shape}, loudness {loudness.shape}, signals {signals.shape}")
+
+    return len(signals)
+
+
+def main():
+    print("\n=== Starting Preprocessing ===")
+
+    class args(Config):
+        CONFIG = None
+
+    args.parse_args()
+    config = load_config(args.CONFIG)
+
+    files = get_files(**config["data"])
+
+    signals_list, pitches_list, loudness_list, total_segments = process_all_files(
+        files, config["preprocess"]
+    )
+
+    final_segment_count = save_preprocessed_data(
+        signals_list, pitches_list, loudness_list, config["preprocess"]["out_dir"]
+    )
+
+    print(f"\nPreprocessing Complete. {final_segment_count} segments saved to {config['preprocess']['out_dir']}")
+
+
+if __name__ == "__main__":
+    main()
+
+--- ./train.py ---
+
+import torch
+import time
+import traceback
+from collections import deque
+from tqdm import tqdm
+from torch.nn.utils.clip_grad import clip_grad_norm_
+
+from ddsp_torch.train_util import (
+    load_configuration, extract_training_parameters, setup_run_directory,
+    initialize_model, setup_loss_functions, run_preprocessing_if_needed,
+    create_dataset_and_dataloader, setup_logging, setup_optimizer_and_scheduler,
+    calculate_loss, log_training_metrics, save_final_results,
+    print_training_info, save_evaluation_audio, format_progress_dict
+)
+
+
+def run_training_loop(model, dataloader, optimizer, scheduler, trainable_params, 
+                     mssl, svl, hdl, train_params, config, run_dir, device,
+                     svl_active, hdl_active, writer, loss_log_path):
+    """Execute the main training loop."""
+    recent_mssl_losses = deque(maxlen=train_params['loss_window'])
+    step_times = deque(maxlen=train_params['steps'])
+    global_step = 0
+    
+    epochs = int(torch.ceil(torch.tensor(train_params['steps'] / len(dataloader), dtype=torch.float32))) if len(dataloader) > 0 else 1
+    
+    print_training_info(config, device, train_params['steps'], train_params['batch_size'], 
+                       epochs, len(dataloader.dataset), len(dataloader))
+    print(f"Gradient Clipping Norm: {train_params['grad_clip_norm']}")
+    
+    if train_params['save_audio_steps']:
+        print(f"\nWill save audio at steps: {train_params['save_audio_steps']}")
+
+    print("\n--- Starting Training ---")
+    pbar = tqdm(total=train_params['steps'], desc="Training", unit="step")
+    training_failed = False
+    
+    try:
+        for epoch in range(epochs):
+            if global_step >= train_params['steps']:
+                break
+
+            for batch_idx, batch_data in enumerate(dataloader):
+                if global_step >= train_params['steps']:
+                    break
+
+                try:
+                    signals, pitches, loudness = batch_data
+                except ValueError as e:
+                    print(f"\nError unpacking batch {batch_idx} in epoch {epoch}: {e}")
+                    continue
+
+                model.train()
+                signals_device = signals.to(device, non_blocking=train_params['pin_memory'] if device.type == 'cuda' else False)
+                pitches_device = pitches.unsqueeze(-1).to(device, non_blocking=train_params['pin_memory'] if device.type == 'cuda' else False)
+                loudness_device = loudness.unsqueeze(-1).to(device, non_blocking=train_params['pin_memory'] if device.type == 'cuda' else False)
+
+                step_start_time = time.perf_counter()
+
+                # Forward pass
+                try:
+                    encoder_config = config.get("model", {}).get("encoder", {})
+                    audio_input = signals_device if encoder_config.get("use_encoder", False) else None
+                    model_outputs = model(pitches_device, loudness_device, audio=audio_input)
+                    forward_time = time.perf_counter() - step_start_time
+                except Exception as e:
+                    print(f"\nError during forward pass at step {global_step}:")
+                    traceback.print_exc()
+                    training_failed = True
+                    break
+
+                # Loss calculation
+                try:
+                    current_mssl_avg = sum(recent_mssl_losses) / len(recent_mssl_losses) if recent_mssl_losses else float('inf')
+                    
+                    total_loss, spectral_loss, variance_loss_value, helmholtz_dev_loss_value, svl_applied, hdl_applied = calculate_loss(
+                        mssl, svl, hdl, model_outputs, signals_device, pitches_device, loudness_device,
+                        svl_active, hdl_active, train_params['svl_activation_threshold'], current_mssl_avg
+                    )
+                    
+                    recent_mssl_losses.append(spectral_loss.item())
+                    total_loss_value = total_loss.item()
+                    spectral_loss_value = spectral_loss.item()
+                    
+                except Exception as e:
+                    print(f"\nError during loss calculation at step {global_step}:")
+                    traceback.print_exc()
+                    training_failed = True
+                    break
+
+                # Backward pass
+                backward_start_time = time.perf_counter()
+                try:
+                    optimizer.zero_grad()
+                    total_loss.backward()
+                    if trainable_params:
+                        clip_grad_norm_(trainable_params, train_params['grad_clip_norm'])
+                    optimizer.step()
+                    scheduler.step()
+                    backward_time = time.perf_counter() - backward_start_time
+                except Exception as e:
+                    print(f"\nError during backward pass at step {global_step}:")
+                    traceback.print_exc()
+                    training_failed = True
+                    break
+
+                # Timing and logging
+                step_end_time = time.perf_counter()
+                total_step_time = step_end_time - step_start_time
+                step_times.append(total_step_time)
+
+                log_training_metrics(
+                    writer, loss_log_path, global_step, total_loss_value, spectral_loss_value,
+                    forward_time, backward_time, total_step_time, variance_loss_value,
+                    helmholtz_dev_loss_value, svl_active, hdl_active
+                )
+
+                # Progress bar update
+                progress_dict = format_progress_dict(
+                    epoch, spectral_loss_value, total_loss_value, current_mssl_avg,
+                    optimizer.param_groups[0]["lr"],
+                    variance_loss_value if svl_applied else None,
+                    helmholtz_dev_loss_value if hdl_applied else None
+                )
+                pbar.set_postfix(progress_dict)
+                pbar.update(1)
+
+                # Save evaluation audio at specified steps
+                if train_params['save_audio_steps'] and global_step in train_params['save_audio_steps']:
+                    print(f"\nSaving evaluation audio at step {global_step}...")
+                    save_evaluation_audio(
+                        model, model.state_dict(), run_dir, config,
+                        dataloader, device, f"step_{global_step}",
+                        num_batches=train_params['save_audio_num_comparisons']
+                    )
+
+                global_step += 1
+
+            if training_failed:
+                break
+
+    except KeyboardInterrupt:
+        print("\nTraining interrupted by user.")
+        training_failed = True
+    except Exception as e:
+        print(f"\nUnexpected error during training:")
+        traceback.print_exc()
+        training_failed = True
+    finally:
+        if pbar:
+            pbar.close()
+
+    return global_step, training_failed, step_times
+
+
+if __name__ == '__main__':
+    # Load configuration and setup
+    config, config_name = load_configuration()
+    train_params = extract_training_parameters(config)
+    run_dir = setup_run_directory(config)
+    
+    # Device setup
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("\n--- Device Information ---")
+    if torch.cuda.is_available():
+        print(f"- Using GPU: {torch.cuda.get_device_name(0)}")
+    else:
+        print("- Using CPU")
+    print("------------------------")
+
+    # Model and loss initialization
+    model = initialize_model(config, device)
+    mssl, svl, hdl, svl_active, hdl_active = setup_loss_functions(config, device)
+
+    # Data pipeline setup
+    preprocess_dir = run_preprocessing_if_needed(config, config_name)
+    dataset, dataloader = create_dataset_and_dataloader(preprocess_dir, train_params)
+
+    # Training infrastructure setup
+    writer, loss_log_path = setup_logging(run_dir, svl_active, hdl_active)
+    optimizer, scheduler, trainable_params = setup_optimizer_and_scheduler(model, train_params)
+
+    # Execute training
+    global_step, training_failed, step_times = run_training_loop(
+        model, dataloader, optimizer, scheduler, trainable_params,
+        mssl, svl, hdl, train_params, config, run_dir, device,
+        svl_active, hdl_active, writer, loss_log_path
+    )
+
+    # Cleanup and final operations
+    if writer:
+        writer.close()
+
+    print("\n--- Training Loop Finished ---")
+
+    if global_step > 0 and not training_failed:
+        print("Saving final model state...")
+        save_final_results(model, run_dir, config, dataloader, device, train_params, global_step)
+    elif training_failed:
+        print("Training failed or interrupted, final model not saved.")
+    else:
+        print("No training steps completed, final model not saved.")
+
+    if step_times:
+        avg_step_time = sum(step_times) / len(step_times)
+        print(f"\nAverage step time: {avg_step_time*1000:.2f} ms")
+        print(f"Total steps completed: {global_step}")
+    else:
+        print("\nNo training steps completed.")
+
+    print("-----------------------------")
+--- ./ddsp_torch/dsp.py ---
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.fft as fft
+import math
+from .core import overlap_and_add
+
+
+def apply_window_to_impulse_response(impulse_response: torch.Tensor, window_size: int = 0, causal: bool = False) -> torch.Tensor:
+    """Applies a Hann window to an impulse response, handling causality and centering."""
+    if causal:
+        impulse_response = torch.fft.fftshift(impulse_response, dim=-1)
+
+    ir_size = impulse_response.shape[-1]
+    if window_size <= 0 or window_size > ir_size:
+        window_size = ir_size
+    
+    window = torch.hann_window(window_size, dtype=impulse_response.dtype, device=impulse_response.device)
+
+    padding = ir_size - window_size
+    if padding > 0:
+        half_idx = (window_size + 1) // 2
+        # Pad window symmetrically in zero-phase form
+        window = torch.cat([
+            window[half_idx:],
+            torch.zeros(padding, device=window.device, dtype=window.dtype),
+            window[:half_idx]
+        ])
+    else:
+        window = torch.fft.fftshift(window, dim=-1)
+
+    windowed_ir = window * impulse_response.real
+
+    if causal:
+        if padding > 0:
+            half_idx = (window_size + 1) // 2
+            first_half_start = ir_size - (half_idx - 1)
+            second_half_end = half_idx
+            # Reconstruct causal form from zero-phase windowed signal
+            windowed_ir = torch.cat([
+                windowed_ir[..., first_half_start:],
+                windowed_ir[..., :second_half_end]
+            ], dim=-1)
+        else:
+            windowed_ir = torch.fft.fftshift(windowed_ir, dim=-1)
+
+    return windowed_ir
+
+
+def frequency_to_impulse_response(magnitude_response: torch.Tensor, window_size: int = 0) -> torch.Tensor:
+    """Converts frequency magnitudes to a time-domain impulse response via iFFT."""
+    complex_spectrum = torch.view_as_complex(
+        torch.stack([magnitude_response, torch.zeros_like(magnitude_response)], -1)
+    )
+    impulse_response = torch.fft.irfft(complex_spectrum)
+
+    # Window and convert to causal form
+    impulse_response = apply_window_to_impulse_response(
+        impulse_response, window_size=window_size, causal=True
+    )
+    return impulse_response
+
+
+def get_fft_size(frame_size: int, ir_size: int, power_of_2: bool = True) -> int:
+    """Calculates required FFT size for convolution to avoid circular convolution."""
+    convolved_frame_size = ir_size + frame_size - 1
+    if power_of_2:
+        return 2**math.ceil(math.log2(convolved_frame_size))
+    return convolved_frame_size
+
+
+def crop_and_compensate_delay(audio: torch.Tensor, audio_size: int, ir_size: int,
+                             padding: str = 'same', delay_compensation: int = -1) -> torch.Tensor:
+    """Crops convolved audio to specified size and compensates for filter delay."""
+    if padding == 'valid':
+        crop_size = ir_size + audio_size - 1
+    elif padding == 'same':
+        crop_size = audio_size
+    else:
+        raise ValueError(f'Padding must be valid or same, got {padding}')
+
+    total_size = audio.shape[-1]
+    crop_amount = total_size - crop_size
+
+    if delay_compensation < 0:
+        start = (ir_size - 1) // 2
+    else:
+        start = delay_compensation
+
+    end = crop_amount - start
+
+    # Ensure valid indices
+    start = max(0, start)
+    end = max(0, end)
+    end_index = total_size - end
+
+    if start >= end_index:
+        print(f"Warning: crop_and_compensate_delay resulted in empty slice, returning original.")
+        return audio
+
+    return audio[..., start:end_index]
+
+
+def fft_convolve(audio: torch.Tensor, impulse_response: torch.Tensor,
+                 padding: str = 'same', delay_compensation: int = -1) -> torch.Tensor:
+    """Performs FFT-based convolution using overlap-add for time-varying IRs."""
+    batch_size, audio_size = audio.shape
+    ir_shape = impulse_response.shape
+
+    if len(ir_shape) == 2:
+        impulse_response = impulse_response.unsqueeze(0)
+
+    ir_batch_size = impulse_response.shape[0]
+    if ir_batch_size == 1 and batch_size > 1:
+        impulse_response = impulse_response.expand(batch_size, -1, -1)
+    elif ir_batch_size > 1 and ir_batch_size != batch_size:
+        raise ValueError(f"Batch dimension mismatch: audio ({batch_size}) vs IR ({ir_batch_size})")
+
+    ir_size = impulse_response.shape[-1]
+    n_ir_frames = impulse_response.shape[-2]
+
+    # Frame audio to match the number of IR frames
+    frame_size = math.ceil(audio_size / n_ir_frames)
+    total_audio_samples_needed = n_ir_frames * frame_size
+    pad_size = total_audio_samples_needed - audio_size
+    audio_padded = F.pad(audio, (0, pad_size))
+
+    audio_frames = audio_padded.unfold(-1, frame_size, frame_size)
+    if audio_frames.shape[1] != n_ir_frames:
+        print(f"Warning: Frame mismatch in fft_convolve audio ({audio_frames.shape[1]}) vs IR ({n_ir_frames}).")
+
+    fft_size = get_fft_size(frame_size, ir_size, power_of_2=True)
+
+    audio_fft = torch.fft.rfft(audio_frames, n=fft_size)
+    ir_fft = torch.fft.rfft(impulse_response, n=fft_size)
+
+    # Convolution in frequency domain
+    convolved_fft = audio_fft * ir_fft
+    audio_frames_out = torch.fft.irfft(convolved_fft, n=fft_size)
+
+    # Overlap-add the convolved frames
+    output = overlap_and_add(audio_frames_out, frame_size)
+
+    return crop_and_compensate_delay(output, audio_size, ir_size, padding, delay_compensation)
+--- ./ddsp_torch/model_utils.py ---
+
+import torch
+from typing import Dict, Any
+
+# Dictionary keys shared between modules
+F0_SCALED = 'f0_scaled'
+LD_SCALED = 'ld_scaled'
+Z = 'z'
+AMPS = 'amps'
+HARMONIC_DISTRIBUTION = 'harmonic_distribution'
+NOISE_MAGNITUDES = 'noise_magnitudes'
+BOW_POSITION_RAW = 'bow_position_raw'
+NOTCH_DEPTH_RAW = 'notch_depth_raw'
+BRIGHTNESS_RAW = 'brightness_raw'
+RESIDUALS_RAW = 'residuals_raw'
+INHARMONICITY_COEFF = 'inharmonicity_coeff'
+
+
+def count_parameters(model):
+    """Counts the number of trainable parameters in a PyTorch model."""
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def create_filter(filter_name: str, filter_type: str, config: Dict[str, Any]):
+    """Creates a filter of the specified type with proper error handling."""
+    from .filters import ConvolutionalFilter, ARFilter, ARMAFilter
+    
+    is_room = filter_name == "room"
+    
+    try:
+        if filter_type == "ar":
+            return ARFilter(**extract_filter_config(config, is_room=is_room))
+        elif filter_type == "arma":
+            return ARMAFilter(**extract_filter_config(config, is_room=is_room))
+        elif filter_type == "convolutional":
+            is_resonance = not is_room
+            return ConvolutionalFilter(**extract_conv_config(config, is_resonance=is_resonance))
+        else:
+            print(f"Warning: Unknown {filter_name} filter type '{filter_type}', skipping.")
+            return None
+    except Exception as e:
+        print(f"Warning: Failed to initialize {filter_name} filter '{filter_type}': {e}")
+        return None
+
+
+def extract_conv_config(config: Dict[str, Any], is_resonance: bool = True) -> Dict[str, Any]:
+    """Extracts convolutional filter configuration with role-based defaults."""
+    prefix = "resonance_" if is_resonance else "room_"
+    
+    if is_resonance:
+        default_add_dry = False
+        default_mask_ir = False
+        default_normalization = "psd_weighted_rms"
+    else:
+        default_add_dry = True
+        default_mask_ir = True
+        default_normalization = "psd_weighted_rms"
+    
+    normalization_type = config.get(f"{prefix}normalization_type", default_normalization)
+    
+    conv_config = {
+        "length": int(config.get(f"{prefix}length", 48000)),
+        "add_dry": bool(config.get(f"{prefix}add_dry", default_add_dry)),
+        "mask_ir": bool(config.get(f"{prefix}mask_ir", default_mask_ir)),
+        "normalization_type": normalization_type
+    }
+    
+    if normalization_type in ["psd_weighted_rms"]:
+        conv_config["n_fft"] = int(config.get(f"{prefix}n_fft", 2048))
+        conv_config["psd_prior"] = str(config.get(f"{prefix}psd_prior", "pink"))
+        conv_config["psd_ema_alpha"] = float(config.get(f"{prefix}psd_ema_alpha", 0.99))
+    
+    return conv_config
+
+
+def extract_filter_config(config: Dict[str, Any], is_room: bool = False) -> Dict[str, Any]:
+    """Extracts AR/ARMA filter configuration with role-based defaults."""
+    prefix = "room_" if is_room else "resonance_"
+    
+    if is_room:
+        default_add_dry = True
+        default_normalization = "rms"
+    else:
+        default_add_dry = False
+        default_normalization = "rms"
+    
+    filter_config = {
+        "add_dry": bool(config.get(f"{prefix}add_dry", default_add_dry)),
+        "max_reflection": float(config.get(f"{prefix}max_reflection", 0.999)),
+        "normalization_type": config.get(f"{prefix}normalization_type", default_normalization)
+    }
+    
+    if config.get(f"{prefix}type") in ["ar", "resonance_type"] and config.get("resonance_type") == "ar":
+        filter_config["lpc_order"] = int(config.get(f"{prefix}ar_order", 16))
+        filter_config["window_size"] = int(config.get(f"{prefix}window_size", 4096))
+    elif config.get(f"{prefix}type") == "ar" or (not is_room and config.get("resonance_type") == "ar"):
+        filter_config["lpc_order"] = int(config.get(f"{prefix}ar_order", 16))
+        filter_config["window_size"] = int(config.get(f"{prefix}window_size", 4096))
+    
+    if config.get(f"{prefix}type") == "arma" or (is_room and config.get("room_type") == "arma") or (not is_room and config.get("resonance_type") == "arma"):
+        filter_config["ar_order"] = int(config.get(f"{prefix}ar_order", 16))
+        filter_config["ma_order"] = int(config.get(f"{prefix}ma_order", 16))
+        filter_config["window_size"] = int(config.get(f"{prefix}window_size", 4096))
+    
+    return filter_config
+
+
+def get_inharmonicity_coefficient(synthesis_params: Dict[str, torch.Tensor], pitch: torch.Tensor,
+                                 use_inharmonicity: bool, inharmonicity_b_max: float = 0.0005) -> torch.Tensor:
+    """Extracts or creates inharmonicity coefficient B."""
+    if use_inharmonicity and INHARMONICITY_COEFF in synthesis_params:
+        B_raw = synthesis_params[INHARMONICITY_COEFF]
+        B = torch.sigmoid(B_raw) * inharmonicity_b_max
+    else:
+        B = torch.zeros_like(pitch)
+    return B
+
+
+def print_model_summary(encoder, decoder, resonance, room, use_helmholtz, violin_config, use_inharmonicity):
+    """Prints a formatted summary of the model architecture and parameters."""
+    print("\n" + "="*60)
+    print("MODEL ARCHITECTURE SUMMARY")
+    print("="*60)
+    
+    if encoder is not None:
+        encoder_params = count_parameters(encoder)
+        print(f"\nEncoder: {encoder_params:,} parameters")
+    else:
+        print("\nEncoder: Not used")
+    
+    decoder_params = count_parameters(decoder)
+    print(f"Decoder: {decoder_params:,} parameters")
+    
+    if resonance is not None:
+        resonance_params = count_parameters(resonance)
+        resonance_type = resonance.__class__.__name__
+        print(f"Resonance Filter ({resonance_type}): {resonance_params:,} parameters")
+    else:
+        print("Resonance Filter: Not used")
+    
+    if room is not None:
+        room_params = count_parameters(room)
+        room_type = room.__class__.__name__
+        print(f"Room Filter ({room_type}): {room_params:,} parameters")
+    else:
+        print("Room Filter: Not used")
+    
+    total_params = decoder_params
+    if encoder is not None:
+        total_params += encoder_params
+    if resonance is not None:
+        total_params += resonance_params
+    if room is not None:
+        total_params += room_params
+    
+    print(f"\nTotal Parameters: {total_params:,}")
+    
+    print("\n" + "-"*60)
+    print("SYNTHESIS CONFIGURATION")
+    print("-"*60)
+    
+    if use_helmholtz:
+        print("\nSynthesis Mode: Violin (Physics-Guided)")
+        print(f"- Bow Position Range: [{violin_config.get('β_min', 'N/A')}, {violin_config.get('β_max', 'N/A')}]")
+        print(f"- Brightness Range: [{violin_config.get('α_min', 'N/A')}, {violin_config.get('α_max', 'N/A')}]")
+        print(f"- Notch Width: {violin_config.get('notch_width', 'N/A')}")
+        print(f"- Residuals: {violin_config.get('n_residuals', 'N/A')}")
+        print(f"- Residual Scale: {violin_config.get('residual_scale', 'N/A')}")
+    else:
+        print("\nSynthesis Mode: Standard DDSP")
+    
+    if use_inharmonicity:
+        print("- Inharmonicity: Enabled")
+    else:
+        print("- Inharmonicity: Disabled")
+    
+    print("="*60 + "\n")
+
+
+def activate_bow_position(raw: torch.Tensor, β_min: float, β_max: float) -> torch.Tensor:
+    """Maps raw decoder output to bow position β in [β_min, β_max]."""
+    sigmoid_val = torch.sigmoid(raw)
+    return β_min + (β_max - β_min) * sigmoid_val
+
+
+def activate_notch_depth(raw: torch.Tensor) -> torch.Tensor:
+    """Maps raw decoder output to notch depth γ in [0, 1]."""
+    return torch.sigmoid(raw)
+
+
+def activate_brightness(raw: torch.Tensor, α_min: float, α_max: float) -> torch.Tensor:
+    """Maps raw decoder output to brightness α in [α_min, α_max]."""
+    sigmoid_val = torch.sigmoid(raw)
+    return α_min + (α_max - α_min) * sigmoid_val
+
+
+def activate_residuals(raw: torch.Tensor, residual_scale: float) -> torch.Tensor:
+    """Maps raw decoder output to residuals centered at 1.0."""
+    tanh_val = torch.tanh(raw)
+    return 1.0 + residual_scale * tanh_val
+
+
+def compute_bow_notch(β: torch.Tensor, n_harmonic: int) -> torch.Tensor:
+    """Computes ideal Helmholtz bow notch for given bow position."""
+    device = β.device
+    dtype = β.dtype
+    batch_size, time_steps, _ = β.shape
+    
+    n = torch.arange(1, n_harmonic + 1, device=device, dtype=dtype).view(1, 1, -1)
+    n_expanded = n.expand(batch_size, time_steps, -1)
+    β_expanded = β.expand(-1, -1, n_harmonic)
+    
+    notch = torch.sin(torch.pi * n_expanded * β_expanded) ** 2
+    return notch
+
+
+def smooth_notch(notch: torch.Tensor, width: float, n_harmonic: int) -> torch.Tensor:
+    """Applies frequency-domain smoothing to the bow notch."""
+    device = notch.device
+    dtype = notch.dtype
+    batch_size, time_steps, _ = notch.shape
+    
+    n_fft = 2 * n_harmonic
+    notch_padded = torch.nn.functional.pad(notch, (0, n_fft - n_harmonic))
+    
+    notch_fft = torch.fft.rfft(notch_padded, dim=-1)
+    
+    freq_bins = notch_fft.shape[-1]
+    freqs = torch.linspace(0, 0.5, freq_bins, device=device, dtype=dtype)
+    
+    sigma = width / (2.0 * torch.pi)
+    window = torch.exp(-0.5 * (freqs / sigma) ** 2)
+    window = window.view(1, 1, -1).expand(batch_size, time_steps, -1)
+    
+    notch_fft_smooth = notch_fft * window
+    notch_smooth_full = torch.fft.irfft(notch_fft_smooth, n=n_fft, dim=-1)
+    notch_smooth = notch_smooth_full[:, :, :n_harmonic]
+    
+    return notch_smooth
+
+
+def physics_harmonic_composer(β: torch.Tensor, γ: torch.Tensor, α: torch.Tensor,
+                              residuals: torch.Tensor, B: torch.Tensor, pitch: torch.Tensor,
+                              n_harmonic: int, notch_width: float, sampling_rate: float) -> tuple:
+    """Composes harmonic magnitudes using violin physics model."""
+    device = β.device
+    dtype = β.dtype
+    batch_size, time_steps, _ = β.shape
+    n_residuals = residuals.shape[-1]
+    
+    n = torch.arange(1, n_harmonic + 1, device=device, dtype=dtype).view(1, 1, -1)
+    n = n.expand(batch_size, time_steps, -1)
+    
+    baseline = 1.0 / n
+    
+    bow_notch = compute_bow_notch(β, n_harmonic)
+    bow_notch_smooth = smooth_notch(bow_notch, notch_width, n_harmonic)
+    bow_mask = 1.0 - γ * (1.0 - bow_notch_smooth)
+    
+    brightness_tilt = n ** (-α)
+    
+    spectrum = baseline * bow_mask * brightness_tilt
+    
+    residuals_full = torch.ones(batch_size, time_steps, n_harmonic, device=device, dtype=dtype)
+    residuals_full[:, :, :n_residuals] = residuals
+    spectrum = spectrum * residuals_full
+    
+    nyquist = sampling_rate / 2.0
+    base_frequencies = pitch * n
+    inharmonicity_factor = torch.sqrt(1.0 + B * (n ** 2))
+    frequencies = base_frequencies * inharmonicity_factor
+    nyquist_mask = (frequencies < nyquist).to(dtype)
+    spectrum_culled = spectrum * nyquist_mask
+    
+    spectrum_culled_sum = spectrum_culled.sum(dim=-1, keepdim=True)
+    safe_mask = (spectrum_culled_sum > 1e-7).to(dtype)
+    fallback = torch.zeros_like(spectrum_culled)
+    fallback[:, :, 0] = 1.0
+    
+    magnitudes_normalized = torch.where(
+        safe_mask.expand_as(spectrum_culled) > 0.5,
+        spectrum_culled / (spectrum_culled_sum + 1e-7),
+        fallback
+    )
+    
+    diagnostics = {
+        'β': β,
+        'γ': γ,
+        'α': α,
+        'B': B,
+        'residuals': residuals,
+        'bow_notch_smooth': bow_notch_smooth,
+        'bow_mask': bow_mask,
+        'brightness_tilt': brightness_tilt,
+        'spectrum_before_culling': spectrum,
+        'nyquist_mask': nyquist_mask,
+        'spectrum_after_culling': spectrum_culled
+    }
+    
+    return magnitudes_normalized, diagnostics
+--- ./ddsp_torch/decoder.py ---
+
+import torch
+import torch.nn as nn
+from .nn import MLP, GRU
+from .model_utils import (
+    F0_SCALED, LD_SCALED, Z, AMPS, HARMONIC_DISTRIBUTION, NOISE_MAGNITUDES,
+    BOW_POSITION_RAW, NOTCH_DEPTH_RAW, BRIGHTNESS_RAW, RESIDUALS_RAW,
+    INHARMONICITY_COEFF
+)
+
+
+class Decoder(nn.Module):
+    """Decodes conditioning inputs into synthesis parameters with dynamic output structure."""
+    
+    def __init__(self, inputs: list[str], z_dims: int | None = None, rnn_channels: int = 512,
+                 ch: int = 512, layers_per_stack: int = 3, use_helmholtz_config: bool = False,
+                 use_inharmonicity_config: bool = True, n_harmonic_config: int = 60,
+                 n_bands_config: int = 65, n_residuals_config: int = 10):
+        super().__init__()
+
+        self.input_names = inputs
+
+        if Z in self.input_names and z_dims is None:
+            raise ValueError("z_dims must be provided if Z is in decoder inputs.")
+
+        self.output_structure = self._build_output_structure(
+            use_helmholtz_config, use_inharmonicity_config, n_harmonic_config,
+            n_bands_config, n_residuals_config
+        )
+
+        self.input_stacks = nn.ModuleDict({
+            name: MLP(z_dims if name == Z else 1, ch, layers_per_stack)
+            for name in self.input_names
+        })
+
+        self.gru = GRU(len(self.input_names) * ch, rnn_channels)
+
+        skip_size = rnn_channels + len(self.input_names) * ch
+        self.out_stack = MLP(skip_size, ch, layers_per_stack)
+
+        total_output_units = sum(size for _, size in self.output_structure)
+        self.dense_out = nn.Linear(ch, total_output_units)
+
+    def _build_output_structure(self, use_helmholtz, use_inharmonicity, n_harmonic, n_bands, n_residuals):
+        """Build output structure based on configuration flags."""
+        structure = [(AMPS, 1)]
+
+        if use_helmholtz:
+            structure.append((BOW_POSITION_RAW, 1))
+            structure.append((NOTCH_DEPTH_RAW, 1))
+            structure.append((BRIGHTNESS_RAW, 1))
+            structure.append((RESIDUALS_RAW, n_residuals))
+        else:
+            structure.append((HARMONIC_DISTRIBUTION, n_harmonic))
+
+        if use_inharmonicity:
+            structure.append((INHARMONICITY_COEFF, 1))
+
+        structure.append((NOISE_MAGNITUDES, n_bands))
+        return structure
+
+    def forward(self, **inputs) -> dict[str, torch.Tensor]:
+        for key in self.input_names:
+            if key not in inputs:
+                raise KeyError(f"Missing required decoder input: {key}")
+
+        processed_inputs = []
+        for name in self.input_names:
+            x = inputs[name]
+            if x.dim() == 2:
+                x = x.unsqueeze(-1)
+            elif x.dim() != 3:
+                raise ValueError(f"Decoder input '{name}' has unexpected shape: {x.shape}. Expected [batch, time, ch].")
+            processed_inputs.append(self.input_stacks[name](x))
+
+        concatenated = torch.cat(processed_inputs, dim=-1)
+        gru_output = self.gru(concatenated)[0]
+
+        skip_connected = torch.cat([gru_output] + processed_inputs, dim=-1)
+        processed = self.out_stack(skip_connected)
+        raw_output = self.dense_out(processed)
+
+        results = {}
+        current_idx = 0
+        for name, size in self.output_structure:
+            results[name] = raw_output[..., current_idx:current_idx + size]
+            current_idx += size
+
+        return results
+--- ./ddsp_torch/synth.py ---
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+import numpy as np
+from typing import Optional
+
+from .dsp import fft_convolve, frequency_to_impulse_response
+from .core import upsample, exp_sigmoid
+
+
+def calculate_inharmonic_frequencies(pitch_frames: torch.Tensor, inharmonicity_coeff_frames: torch.Tensor,
+                                   n_harmonic: int, sampling_rate: float) -> torch.Tensor:
+    """Calculates inharmonic frequencies using Railsback's formula."""
+    device, dtype = pitch_frames.device, pitch_frames.dtype
+    harmonic_numbers = torch.arange(1, n_harmonic + 1, device=device, dtype=dtype).view(1, 1, -1)
+    
+    pitch_expanded = pitch_frames.unsqueeze(-1) if pitch_frames.dim() == 2 else pitch_frames
+    inharmonicity_expanded = inharmonicity_coeff_frames.unsqueeze(-1) if inharmonicity_coeff_frames.dim() == 2 else inharmonicity_coeff_frames
+    
+    inharmonicity_factor = torch.sqrt(1.0 + inharmonicity_expanded * (harmonic_numbers ** 2))
+    base_harmonic_freqs = pitch_expanded * harmonic_numbers
+    inharmonic_freqs = base_harmonic_freqs * inharmonicity_factor
+    
+    return inharmonic_freqs
+
+
+def harmonic_synth(pitch_frames: torch.Tensor, amplitudes_dist_normalized_frames: torch.Tensor, 
+                   total_amp_frames: torch.Tensor, sampling_rate: int, block_size: int,
+                   inharmonicity_coeff_frames: torch.Tensor | None = None):
+    """Generates harmonic signal using additive synthesis (standard DDSP mode)."""
+    n_harmonic = amplitudes_dist_normalized_frames.shape[-1]
+    
+    total_amplitude_expanded = total_amp_frames.unsqueeze(-1) if total_amp_frames.dim() == 2 else total_amp_frames
+    final_amplitudes = amplitudes_dist_normalized_frames * total_amplitude_expanded
+    amplitudes_upsampled = upsample(final_amplitudes, block_size, method='window')
+
+    if inharmonicity_coeff_frames is not None and torch.any(inharmonicity_coeff_frames.abs() > 1e-7):
+        frequencies_frames = calculate_inharmonic_frequencies(
+            pitch_frames, inharmonicity_coeff_frames, n_harmonic, float(sampling_rate)
+        )
+    else:
+        device, dtype = pitch_frames.device, pitch_frames.dtype
+        harmonic_numbers = torch.arange(1, n_harmonic + 1, device=device, dtype=dtype).view(1, 1, -1)
+        pitch_expanded = pitch_frames.unsqueeze(-1) if pitch_frames.dim() == 2 else pitch_frames
+        frequencies_frames = pitch_expanded * harmonic_numbers
+    
+    frequencies_upsampled = upsample(frequencies_frames, block_size, method='window')
+    
+    phase = torch.cumsum(2 * math.pi * frequencies_upsampled / float(sampling_rate), dim=1)
+    harmonic_signals = torch.sin(phase) * amplitudes_upsampled
+    signal = harmonic_signals.sum(dim=-1, keepdim=True)
+    
+    return signal
+
+
+def filtered_noise_synth(noise_magnitudes_frames: torch.Tensor, block_size: int):
+    """Generates filtered noise using frequency-domain filtering."""
+    batch_size, n_time_frames, n_bands = noise_magnitudes_frames.shape
+    
+    ir_size = n_bands * 2 - 1
+    impulse_responses = frequency_to_impulse_response(noise_magnitudes_frames, window_size=ir_size)
+    
+    total_samples = n_time_frames * block_size
+    noise_signal = torch.rand(batch_size, total_samples, device=impulse_responses.device) * 2 - 1
+    
+    filtered_noise = fft_convolve(noise_signal, impulse_responses, padding='same')
+    
+    if filtered_noise.dim() == 2:
+        filtered_noise = filtered_noise.unsqueeze(-1)
+    
+    if filtered_noise.shape[1] > total_samples:
+        filtered_noise = filtered_noise[:, :total_samples, :]
+    elif filtered_noise.shape[1] < total_samples:
+        pad_amount = total_samples - filtered_noise.shape[1]
+        filtered_noise = F.pad(filtered_noise, (0, 0, 0, pad_amount))
+    
+    return filtered_noise
+--- ./ddsp_torch/filter_utils.py ---
+
+import torch
+import numpy as np
+
+
+def reflection_to_ar(reflection_coefficients):
+    """Converts reflection coefficients (k) to direct-form AR coefficients (a)."""
+    is_tensor = isinstance(reflection_coefficients, torch.Tensor)
+
+    if is_tensor:
+        k = reflection_coefficients.clone()
+        device = k.device
+        dtype = k.dtype
+    else:
+        k_array = np.asarray(reflection_coefficients)
+        k = torch.tensor(k_array)
+        device = k.device
+        dtype = k.dtype
+
+    # Ensure batch dimension for consistent processing
+    batched = k.dim() > 1
+    if not batched:
+        k = k.unsqueeze(0)
+
+    batch_size, Q = k.shape
+    a = torch.zeros(batch_size, Q + 1, device=device, dtype=dtype)
+    a[:, 0] = 1.0  # a_0 is always 1
+
+    # Iteratively compute AR coefficients using Levinson-Durbin recursion
+    for i in range(Q):
+        a_previous = a[:, :i+1].clone()  # Coefficients from previous step
+        a[:, i+1] = k[:, i] * a_previous[:, 0]
+
+        if i > 0:
+            # Update intermediate coefficients using recursion
+            indices = torch.arange(1, i + 1, device=device)
+            reversed_indices = i - indices + 1
+            a[:, indices] = a_previous[:, indices] + k[:, i:i+1] * a_previous[:, reversed_indices]
+
+    # Remove batch dimension if it was added
+    if not batched:
+        a = a.squeeze(0)
+        
+    return a
+--- ./ddsp_torch/nn.py ---
+
+import torch.nn as nn
+
+
+def MLP(input_size, hidden_size, num_layers):
+    """Creates a multi-layer perceptron with LayerNorm and LeakyReLU activations."""
+    layer_sizes = [input_size] + (num_layers) * [hidden_size]
+    layers = []
+    
+    for i in range(num_layers):
+        layers.append(nn.Linear(layer_sizes[i], layer_sizes[i + 1]))
+        layers.append(nn.LayerNorm(layer_sizes[i + 1]))
+        layers.append(nn.LeakyReLU())
+    
+    return nn.Sequential(*layers)
+
+
+def GRU(input_features, hidden_size, multiply_input_size=False, bidirectional=False):
+    """Creates a GRU layer with optional input size multiplication."""
+    actual_input_size = input_features * hidden_size if multiply_input_size else input_features
+    
+    return nn.GRU(
+        actual_input_size, 
+        hidden_size, 
+        batch_first=True, 
+        bidirectional=bidirectional
+    )
+
+
+class Normalize(nn.Module):
+    """Instance normalization layer that handles different input dimensions."""
+    
+    def __init__(self, num_channels):
+        super().__init__()
+        self.norm = nn.InstanceNorm1d(num_channels, eps=1e-5)
+    
+    def forward(self, x):
+        original_shape = x.shape
+        needs_transpose = len(x.shape) == 3 and original_shape[2] == self.norm.num_features
+        
+        if needs_transpose:
+            x = x.transpose(1, 2)
+            
+        x = self.norm(x)
+        
+        if needs_transpose:
+            x = x.transpose(1, 2)
+            
+        return x
+--- ./ddsp_torch/__init__.py ---
+
+"""DDSP PyTorch implementation package."""
+pass
+--- ./ddsp_torch/core.py ---
+
+import torch
+import torch.nn as nn
+import torch.fft as fft
+import torch.nn.functional as F
+import numpy as np
+import librosa as li
+import math
+import os
+
+DB_RANGE = 80.0
+F0_RANGE = 127.0
+
+_crepe_model_info_printed = False
+
+
+def overlap_and_add(signal: torch.Tensor, frame_step: int) -> torch.Tensor:
+    """Reconstructs a signal from overlapping frames using overlap-add."""
+    if signal.dim() < 2:
+        raise ValueError(f"Signal must have at least rank 2, got shape {signal.shape}")
+
+    outer_dimensions = signal.shape[:-2]
+    n_frames = signal.shape[-2]
+    frame_length = signal.shape[-1]
+    output_length = frame_length + frame_step * (n_frames - 1)
+
+    if frame_length == frame_step:
+        return signal.reshape(*outer_dimensions, -1)
+
+    # Calculate padding for overlap-add processing
+    segments = math.ceil(frame_length / frame_step)
+    pad_length = (segments * frame_step) - frame_length
+    padding = (0, pad_length, 0, segments)
+    signal = F.pad(signal, padding)
+
+    shape = outer_dimensions + (n_frames + segments, segments, frame_step)
+    signal = signal.reshape(shape)
+
+    # Permute to bring segments dimension forward for summation
+    dims = list(range(signal.dim()))
+    dims = dims[:-3] + [dims[-2], dims[-3], dims[-1]]
+    signal = signal.permute(*dims)
+
+    shape = outer_dimensions + ((n_frames + segments) * segments, frame_step)
+    signal = signal.reshape(shape)
+
+    # Truncate unnecessary padded frames
+    signal = signal[..., :(n_frames + segments - 1) * segments, :]
+
+    shape = outer_dimensions + (segments, n_frames + segments - 1, frame_step)
+    signal = signal.reshape(shape)
+    signal = torch.sum(signal, dim=-3)
+
+    # Reshape and truncate to correct output length
+    signal = signal.reshape(*outer_dimensions, -1)[..., :output_length]
+    return signal
+
+
+def scale_db(db: torch.Tensor) -> torch.Tensor:
+    """Scales loudness in dB to range [0, 1]."""
+    result = (db / DB_RANGE) + 1.0
+    return torch.clamp(result, 0.0, 1.0)
+
+
+def scale_f0_hz(f0_hz: torch.Tensor) -> torch.Tensor:
+    """Scales frequency in Hz to range [0, 1] via MIDI conversion."""
+    midi_notes = hz_to_midi(f0_hz)
+    scaling_factor = torch.tensor(F0_RANGE, device=f0_hz.device, dtype=f0_hz.dtype)
+    midi_notes_clamped = torch.clamp(midi_notes, 0.0, F0_RANGE)
+    result = torch.div(midi_notes_clamped, scaling_factor)
+    return torch.clamp(result, 0.0, 1.0)
+
+
+def safe_log(x: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+    """Computes log(x + eps) to avoid log(0)."""
+    return torch.log(x + eps)
+
+
+def multiscale_fft(signal: torch.Tensor, scales: list[int], overlap: float) -> list[torch.Tensor]:
+    """Computes STFT magnitudes at multiple FFT sizes."""
+    stfts = []
+    signal = signal.to(torch.float32)
+    
+    for scale in scales:
+        hop_length = int(scale * (1 - overlap))
+        window = torch.hann_window(scale, device=signal.device)
+        
+        stft_result = torch.stft(
+            signal,
+            n_fft=scale,
+            hop_length=hop_length,
+            win_length=scale,
+            window=window,
+            center=True,
+            pad_mode='reflect',
+            normalized=False,
+            onesided=True,
+            return_complex=True,
+        )
+        stfts.append(torch.abs(stft_result))
+    
+    return stfts
+
+
+def upsample_with_windows_torch(inputs: torch.Tensor, n_timesteps: int, add_endpoint: bool = True) -> torch.Tensor:
+    """Upsamples control signals using Hanning windowed overlap-add."""
+    inputs = inputs.float()
+
+    if inputs.dim() != 3:
+        raise ValueError(f'upsample_with_windows_torch only supports 3D input [batch, time, ch], got {inputs.shape}')
+
+    batch_size, n_frames_orig, n_channels = inputs.shape
+
+    if add_endpoint:
+        inputs = torch.cat([inputs, inputs[:, -1:, :]], dim=1)
+        n_frames = n_frames_orig + 1
+    else:
+        n_frames = n_frames_orig
+
+    n_intervals = n_frames - 1
+    
+    if n_intervals <= 0:
+        if n_timesteps % n_frames == 0:
+            factor = n_timesteps // n_frames
+            return inputs.repeat_interleave(factor, dim=1)
+        else:
+            print(f"Warning: Upsampling with 1 frame and non-divisible target length ({n_timesteps}) - tiling and cropping.")
+            factor = math.ceil(n_timesteps / n_frames)
+            return inputs.repeat_interleave(factor, dim=1)[:, :n_timesteps, :]
+
+    if n_frames > n_timesteps:
+        raise ValueError(f'Upsampling requires n_timesteps ({n_timesteps}) >= n_frames ({n_frames}).')
+
+    if n_timesteps % n_intervals != 0:
+        raise ValueError(f'Target n_timesteps ({n_timesteps}) must be divisible by number of intervals ({n_intervals}).')
+
+    hop_size = n_timesteps // n_intervals
+    window_length = 2 * hop_size
+    window = torch.hann_window(window_length, device=inputs.device)
+
+    # Apply windowing for overlap-add
+    inputs_reshaped = inputs.permute(0, 2, 1).reshape(-1, n_frames, 1)
+    windowed_inputs = inputs_reshaped * window.view(1, 1, -1)
+
+    output = overlap_and_add(windowed_inputs, hop_size)
+    output = output.reshape(batch_size, n_channels, -1).permute(0, 2, 1)
+
+    # Trim edges from overlap-add process
+    start_idx = hop_size
+    end_idx = output.shape[1] - hop_size
+    output_trimmed = output[:, start_idx:end_idx, :]
+
+    # Ensure exact length
+    if output_trimmed.shape[1] != n_timesteps:
+        if output_trimmed.shape[1] < n_timesteps:
+            pad_len = n_timesteps - output_trimmed.shape[1]
+            output_trimmed = F.pad(output_trimmed, (0, 0, 0, pad_len))
+        elif output_trimmed.shape[1] > n_timesteps:
+            output_trimmed = output_trimmed[:, :n_timesteps, :]
+
+    return output_trimmed
+
+
+def upsample(signal: torch.Tensor, factor: int, method: str = 'linear') -> torch.Tensor:
+    """Upsamples the time dimension of a signal by integer factor."""
+    if factor == 1:
+        return signal
+
+    if method == 'linear':
+        signal_permuted = signal.permute(0, 2, 1)
+        output = nn.functional.interpolate(
+            signal_permuted,
+            scale_factor=float(factor),
+            mode='linear',
+            align_corners=False
+        )
+        return output.permute(0, 2, 1)
+    elif method == 'window':
+        target_length = signal.shape[1] * factor
+        return upsample_with_windows_torch(signal, target_length)
+    else:
+        raise ValueError(f"Unknown upsampling method: {method}")
+
+
+def remove_above_nyquist(amplitudes: torch.Tensor, pitch: torch.Tensor, sampling_rate: float | int,
+                        inharmonicity_coeff: torch.Tensor | None = None) -> torch.Tensor:
+    """Zeros amplitudes of harmonics above the Nyquist frequency.
+    
+    Args:
+        amplitudes: Harmonic amplitudes [B, T, n_harmonics]
+        pitch: Fundamental frequency [B, T, 1]
+        sampling_rate: Audio sampling rate in Hz
+        inharmonicity_coeff: Inharmonicity coefficient B [B, T, 1]. If provided,
+                           applies inharmonicity before Nyquist check to avoid aliasing.
+    
+    Returns:
+        Masked amplitudes with harmonics above Nyquist set to zero
+    """
+    n_harmonics = amplitudes.shape[-1]
+    harmonic_numbers = torch.arange(1, n_harmonics + 1, device=amplitudes.device, dtype=amplitudes.dtype)
+    
+    # Calculate base harmonic frequencies
+    base_harmonic_freqs = pitch * harmonic_numbers
+    
+    # Apply inharmonicity if provided
+    if inharmonicity_coeff is not None and torch.any(inharmonicity_coeff.abs() > 1e-7):
+        inharmonicity_factor = torch.sqrt(1.0 + inharmonicity_coeff * (harmonic_numbers ** 2))
+        harmonic_freqs = base_harmonic_freqs * inharmonicity_factor
+    else:
+        harmonic_freqs = base_harmonic_freqs
+    
+    nyquist = sampling_rate / 2.0
+    mask = (harmonic_freqs < nyquist).to(amplitudes.dtype)
+    return amplitudes * mask
+
+
+def exp_sigmoid(x: torch.Tensor, exponent: float = 10.0, max_value: float = 2.0, threshold: float = 1e-7) -> torch.Tensor:
+    """Exponentiated sigmoid function: max_value * sigmoid(x)**log(exponent) + threshold."""
+    x = x.float()
+    exponent = torch.tensor(exponent, device=x.device, dtype=torch.float32)
+    max_value = torch.tensor(max_value, device=x.device, dtype=torch.float32)
+    threshold = torch.tensor(threshold, device=x.device, dtype=torch.float32)
+    return max_value * torch.sigmoid(x)**torch.log(exponent) + threshold
+
+
+def extract_loudness(signal: np.ndarray | torch.Tensor, sampling_rate: int, block_size: int,
+                     n_fft: int = 2048, range_db: float = DB_RANGE, ref_db: float = 20.0) -> np.ndarray:
+    """Extracts A-weighted loudness in dB using librosa."""
+    if isinstance(signal, torch.Tensor):
+        signal = signal.detach().cpu().numpy()
+
+    if signal.ndim > 1:
+        print("Warning: extract_loudness received multi-channel signal, using first channel.")
+        signal = signal[0] if signal.shape[0] < signal.shape[1] else signal[:, 0]
+
+    stft_result = li.stft(signal, n_fft=n_fft, hop_length=block_size, win_length=n_fft, center=True, pad_mode='reflect')
+    power_spectrum = np.abs(stft_result)**2
+    frequencies = li.fft_frequencies(sr=sampling_rate, n_fft=n_fft)
+    a_weighting = li.A_weighting(frequencies)
+
+    # Apply A-weighting in dB domain
+    weighted_power_db = 10.0 * np.log10(power_spectrum + 1e-10) + a_weighting[:, np.newaxis]
+    loudness_db = np.mean(weighted_power_db, axis=0)
+
+    # Apply reference and range clipping
+    loudness_db -= ref_db
+    loudness_db = np.maximum(loudness_db, -range_db)
+
+    return loudness_db.astype(np.float32)
+
+
+def extract_pitch(signal: np.ndarray | torch.Tensor, sampling_rate: int, block_size: int,
+                  crepe_model_path: str | None = None, crepe_model_capacity: str = 'full',
+                  viterbi: bool = True) -> np.ndarray:
+    """Extracts fundamental frequency using CREPE."""
+    global _crepe_model_info_printed
+    
+    try:
+        import crepe
+    except ImportError:
+        raise ImportError("CREPE pitch extractor requires the 'crepe' library. Please install it (pip install crepe).")
+
+    if isinstance(signal, torch.Tensor):
+        signal = signal.detach().cpu().numpy()
+
+    if signal.ndim > 1:
+        print("Warning: extract_pitch received multi-channel signal, using first channel.")
+        signal = signal[0] if signal.shape[0] < signal.shape[1] else signal[:, 0]
+    
+    signal = signal.astype(np.float32)
+    step_size_ms = int(1000 * block_size / sampling_rate)
+
+    # Handle custom CREPE model loading
+    model_capacity_to_use = crepe_model_capacity
+    if crepe_model_path and os.path.exists(crepe_model_path):
+        try:
+            from tensorflow.keras.models import load_model
+            custom_model = load_model(crepe_model_path)
+            crepe.core.models['custom'] = custom_model
+            model_capacity_to_use = 'custom'
+            model_info = f"custom model from {crepe_model_path}"
+        except ImportError:
+            print("Warning: TensorFlow/Keras not found. Cannot load custom CREPE model.")
+            model_info = f"default '{model_capacity_to_use}' model (custom path ignored)"
+        except Exception as e:
+            print(f"Warning: Failed to load custom CREPE model from {crepe_model_path}: {e}")
+            model_info = f"default '{model_capacity_to_use}' model (custom path load failed)"
+    else:
+        model_info = f"default '{model_capacity_to_use}' model"
+
+    if not _crepe_model_info_printed:
+        print(f"\nUsing CREPE {model_info} for pitch extraction.")
+        _crepe_model_info_printed = True
+
+    target_length = math.ceil(signal.shape[-1] / block_size)
+
+    try:
+        times, frequency, confidence, activation = crepe.predict(
+            signal, sampling_rate, model_capacity=model_capacity_to_use,
+            step_size=step_size_ms, viterbi=viterbi, verbose=0, center=True,
+        )
+    except Exception as e:
+        print(f"Error during CREPE prediction: {e}")
+        return np.zeros(target_length, dtype=np.float32)
+
+    # Interpolate to match exact target length
+    if len(frequency) != target_length:
+        crepe_time_axis = times
+        target_time_axis = np.arange(target_length) * block_size / sampling_rate
+        
+        if len(crepe_time_axis) < 2:
+            interpolated_freq = np.full(target_length, frequency[0], dtype=np.float32) if len(frequency) == 1 else np.zeros(target_length, dtype=np.float32)
+        else:
+            interpolated_freq = np.interp(
+                target_time_axis, crepe_time_axis, frequency,
+                left=frequency[0], right=frequency[-1]
+            ).astype(np.float32)
+    else:
+        interpolated_freq = frequency.astype(np.float32)
+
+    # Final length adjustment
+    if len(interpolated_freq) > target_length:
+        interpolated_freq = interpolated_freq[:target_length]
+    elif len(interpolated_freq) < target_length:
+        pad_len = target_length - len(interpolated_freq)
+        interpolated_freq = np.pad(interpolated_freq, (0, pad_len), mode='edge')
+
+    return interpolated_freq
+
+
+def hz_to_midi(frequencies: torch.Tensor | np.ndarray) -> torch.Tensor | np.ndarray:
+    """Converts frequencies in Hz to MIDI notes (A4=440Hz=69)."""
+    is_torch = isinstance(frequencies, torch.Tensor)
+    lib = torch if is_torch else np
+
+    min_freq = 1e-7
+    valid_mask = frequencies > 0
+    frequencies_safe = lib.where(valid_mask, frequencies, min_freq)
+
+    log_term = lib.log(frequencies_safe / 440.0) / lib.log(lib.tensor(2.0) if is_torch else np.log(2.0))
+    notes = 12.0 * log_term + 69.0
+    output_notes = lib.where(valid_mask, notes, 0.0)
+
+    return output_notes.float() if is_torch else output_notes.astype(np.float32)
+--- ./ddsp_torch/encoder.py ---
+
+import torch
+import torch.nn as nn
+import torchaudio
+from .nn import MLP, GRU, Normalize
+
+
+class Encoder(nn.Module):
+    """Encodes audio into a latent representation using MFCCs and a GRU."""
+    
+    def __init__(self, rnn_channels: int = 512, z_dims: int = 16, z_time_steps: int = 125,
+                 sample_rate: int = 16000, target_length: int = 1000, mfcc_config: dict = None):
+        super().__init__()
+
+        self.target_length = target_length
+
+        # Default MFCC settings
+        if mfcc_config is None:
+            mfcc_config = {
+                'n_mfcc': 30, 'n_mels': 128, 'f_min': 20.0,
+                'f_max': 8000.0, 'log_mels': True
+            }
+
+        # Determine FFT/hop sizes based on z_time_steps
+        self.fft_size, self.hop_length = self._get_stft_params(z_time_steps)
+
+        # MFCC extraction layer
+        self.mfcc_transform = torchaudio.transforms.MFCC(
+            sample_rate=sample_rate,
+            n_mfcc=mfcc_config.get('n_mfcc', 30),
+            log_mels=mfcc_config.get('log_mels', True),
+            melkwargs={
+                'n_fft': self.fft_size,
+                'n_mels': mfcc_config.get('n_mels', 128),
+                'hop_length': self.hop_length,
+                'f_min': mfcc_config.get('f_min', 20.0),
+                'f_max': mfcc_config.get('f_max', 8000.0),
+            }
+        )
+
+        # Processing layers
+        n_mfcc = mfcc_config.get('n_mfcc', 30)
+        self.norm = Normalize(n_mfcc)
+        self.gru = GRU(n_mfcc, rnn_channels, multiply_input_size=False)
+        self.dense_out = nn.Linear(rnn_channels, z_dims)
+
+    def _get_stft_params(self, z_time_steps):
+        """Get FFT size and hop length based on desired time steps."""
+        valid_steps = {
+            63: {'fft_size': 2048, 'overlap': 0.5},
+            125: {'fft_size': 1024, 'overlap': 0.5},
+            250: {'fft_size': 1024, 'overlap': 0.75},
+            500: {'fft_size': 512, 'overlap': 0.75},
+            1000: {'fft_size': 256, 'overlap': 0.75}
+        }
+        
+        if z_time_steps not in valid_steps:
+            raise ValueError(f'z_time_steps must be one of {list(valid_steps.keys())}, got {z_time_steps}')
+        
+        spec = valid_steps[z_time_steps]
+        fft_size = spec['fft_size']
+        hop_length = int(fft_size * (1 - spec['overlap']))
+        
+        return fft_size, hop_length
+
+    def compute_z(self, audio):
+        """Computes latent vectors before temporal interpolation."""
+        # Extract MFCCs: [batch, n_mfcc, time_mfcc]
+        z_mfcc = self.mfcc_transform(audio)
+        z_mfcc = z_mfcc.transpose(1, 2)  # [batch, time_mfcc, n_mfcc]
+
+        # Process through normalization, GRU, and projection
+        z_normalized = self.norm(z_mfcc)
+        z_gru_output, _ = self.gru(z_normalized)
+        z_projected = self.dense_out(z_gru_output)
+        
+        return z_projected
+
+    def expand_z(self, z, target_time_steps):
+        """Interpolates the time dimension of z to match target_time_steps."""
+        if z.shape[1] == target_time_steps:
+            return z
+
+        # Interpolate time dimension: [batch, time, z_dims] -> [batch, target_time, z_dims]
+        z_transposed = z.transpose(1, 2)  # [batch, z_dims, time]
+        z_interpolated = torch.nn.functional.interpolate(
+            z_transposed,
+            size=target_time_steps,
+            mode='linear',
+            align_corners=False
+        )
+        return z_interpolated.transpose(1, 2)  # [batch, target_time, z_dims]
+
+    def forward(self, audio):
+        """Runs the encoder: MFCC -> Normalize -> GRU -> Linear -> Interpolate."""
+        z_raw = self.compute_z(audio)
+        z_expanded = self.expand_z(z_raw, self.target_length)
+        return z_expanded
+--- ./ddsp_torch/train_util.py ---
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import soundfile as sf
+import yaml
+import numpy as np
+import math
+import subprocess
+import sys
+import traceback
+from os import path, makedirs
+from torch.utils.tensorboard import SummaryWriter
+from torch.optim.lr_scheduler import _LRScheduler
+
+from preprocess import Dataset
+from ddsp_torch.model import DDSP
+from ddsp_torch.losses import MultiScaleSTFTLoss, SourceVarianceLoss, ViolinPhysicsLoss
+
+
+class TFExponentialDecay(_LRScheduler):
+    """Learning rate scheduler mimicking TensorFlow's ExponentialDecay."""
+    
+    def __init__(self, optimizer: torch.optim.Optimizer, initial_lr: float, decay_steps: int, 
+                 decay_rate: float, staircase: bool = False):
+        self.initial_lr = initial_lr
+        self.decay_steps = decay_steps
+        self.decay_rate = decay_rate
+        self.staircase = staircase
+        super().__init__(optimizer)
+
+    def get_lr(self) -> list[float]:
+        step = self._step_count
+
+        if self.staircase:
+            exponent = step // self.decay_steps
+        else:
+            exponent = step / self.decay_steps
+
+        decay_factor = self.decay_rate ** exponent
+        current_lr = self.initial_lr * decay_factor
+
+        return [current_lr for _ in self.base_lrs]
+
+
+def get_tensorflow_scheduler(optimizer: torch.optim.Optimizer, initial_lr: float = 0.001, 
+                           decay_steps: int = 10000, decay_rate: float = 0.98, 
+                           staircase: bool = False) -> TFExponentialDecay:
+    return TFExponentialDecay(
+        optimizer=optimizer,
+        initial_lr=initial_lr,
+        decay_steps=decay_steps,
+        decay_rate=decay_rate,
+        staircase=staircase
+    )
+
+
+def load_configuration():
+    """Parse arguments and load configuration file."""
+    from effortless_config import Config
+    
+    class args(Config):
+        CONFIG = None
+
+    args.parse_args()
+
+    if args.CONFIG is None:
+        config_path = "config.yaml"
+        print(f"Using default configuration: {config_path}")
+    else:
+        config_path = f"configs/{args.CONFIG}.yaml"
+        print(f"Using specified configuration: {config_path}")
+
+    if not path.exists(config_path):
+        print(f"Error: Config file not found at {config_path}")
+        sys.exit(1)
+
+    try:
+        with open(config_path, "r") as config_file:
+            config = yaml.safe_load(config_file)
+        print("Configuration loaded successfully.")
+        return config, args.CONFIG
+    except Exception as e:
+        print(f"Error loading config file {config_path}: {e}")
+        sys.exit(1)
+
+
+def extract_training_parameters(config):
+    """Extract and validate training parameters from config."""
+    try:
+        train_config = config["train"]
+        return {
+            'steps': int(train_config.get("steps", 30000)),
+            'batch_size': int(train_config.get("batch_size", 4)),
+            'loss_window': int(train_config.get("loss_window", 10)),
+            'save_audio_steps': train_config.get("save_audio_steps", []),
+            'save_audio_num_comparisons': int(train_config.get("save_audio_num_comparisons", 1)),
+            'grad_clip_norm': float(train_config.get("gradient_clip_norm", 3.0)),
+            'initial_lr': float(train_config.get("learning_rate", 0.001)),
+            'decay_steps': int(train_config.get("lr_decay_steps", 10000)),
+            'decay_rate': float(train_config.get("lr_decay_rate", 0.98)),
+            'staircase': bool(train_config.get("lr_staircase", False)),
+            'svl_activation_threshold': float(train_config.get("svl_activation_threshold", 10.0)),
+            'num_workers': int(train_config.get("dataloader_num_workers", 4)),
+            'pin_memory': bool(train_config.get("dataloader_pin_memory", True))
+        }
+    except KeyError as e:
+        print(f"Error: Missing required key in 'train' config section: {e}")
+        sys.exit(1)
+    except ValueError as e:
+        print(f"Error: Invalid value type in 'train' config section: {e}")
+        sys.exit(1)
+
+
+def setup_run_directory(config):
+    """Create run directory and save config."""
+    train_config = config["train"]
+    run_dir = path.join(train_config.get("root", "runs"), train_config["name"])
+    makedirs(run_dir, exist_ok=True)
+    print(f"Run directory: {run_dir}")
+    
+    try:
+        with open(path.join(run_dir, "config.yaml"), "w") as f:
+            yaml.safe_dump(config, f)
+    except Exception as e:
+        print(f"Warning: Could not save config to run directory: {e}")
+    
+    return run_dir
+
+
+def initialize_model(config, device):
+    """Initialize DDSP model and move to device."""
+    try:
+        model = DDSP(**config.get("model", {})).to(device)
+        return model
+    except KeyError as e:
+        print(f"Error: Missing required key in 'model' config section: {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error initializing DDSP model:")
+        traceback.print_exc()
+        sys.exit(1)
+
+
+def setup_loss_functions(config, device):
+    """Initialize loss functions based on configuration."""
+    loss_config = config.get("loss", {})
+    model_config = config.get("model", {})
+    helmholtz_config = model_config.get("helmholtz", {})
+    violin_loss_config = loss_config.get("violin_physics", {})
+    
+    use_violin_synthesis = bool(helmholtz_config.get("use_helmholtz_synthesis", False))
+    use_vpl_config_flag = bool(loss_config.get("use_helmholtz_deviation_loss", True))
+    
+    try:
+        mssl = MultiScaleSTFTLoss(
+            scales=loss_config["mssl"]["scales"],
+            overlap=loss_config["mssl"]["overlap"]
+        ).to(device)
+
+        svl = None
+        use_svl_config_flag = bool(loss_config.get("use_source_variance", False))
+        svl_active = use_svl_config_flag and not use_violin_synthesis
+
+        if svl_active:
+            svl_params = loss_config.get("source_variance", {})
+            svl = SourceVarianceLoss(**svl_params).to(device)
+            print("\nSource Variance Loss: Enabled (Standard Mode)")
+        elif use_svl_config_flag and use_violin_synthesis:
+            print("\nSource Variance Loss: Configured but INACTIVE (Violin Mode)")
+        else:
+            print("\nSource Variance Loss: Disabled")
+
+        vpl = None
+        vpl_weight = float(violin_loss_config.get("weight", 0.0))
+        vpl_active = use_violin_synthesis and use_vpl_config_flag and vpl_weight > 0
+
+        if vpl_active:
+            vpl = ViolinPhysicsLoss(
+                weight=vpl_weight,
+                weight_β=float(violin_loss_config.get("smoothness_β", 0.01)),
+                weight_α=float(violin_loss_config.get("smoothness_α", 0.01)),
+                weight_γ=float(violin_loss_config.get("smoothness_γ", 0.01)),
+                weight_B=float(violin_loss_config.get("smoothness_B", 0.01)),
+                weight_residuals=float(violin_loss_config.get("residual_magnitude", 0.01)),
+                residual_loss_type=str(violin_loss_config.get("residual_loss_type", "l1")),
+                use_activation_filter=bool(violin_loss_config.get("use_activation_filter", True)),
+                loudness_threshold=float(violin_loss_config.get("loudness_threshold", 0.2)),
+                pitch_threshold=float(violin_loss_config.get("pitch_threshold", 20.0))
+            ).to(device)
+            print(f"Violin Physics Loss: Enabled (Weight: {vpl_weight})")
+        elif use_violin_synthesis and (not use_vpl_config_flag or vpl_weight <= 0):
+            status_reasons = []
+            if not use_vpl_config_flag:
+                status_reasons.append("Config Toggle is False")
+            if vpl_weight <= 0:
+                status_reasons.append("Weight is <= 0")
+            print(f"Violin Physics Loss: Configured but INACTIVE ({', '.join(status_reasons)})")
+        else:
+            print("Violin Physics Loss: Disabled")
+
+        return mssl, svl, vpl, svl_active, vpl_active
+
+    except KeyError as e:
+        print(f"Error: Missing required key in loss config: {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error setting up loss functions: {e}")
+        sys.exit(1)
+
+
+def run_preprocessing_if_needed(config, config_name):
+    """Run preprocessing subprocess if needed."""
+    try:
+        preprocess_dir, preprocess_exists = setup_data_pipeline(config)
+    except Exception as e:
+        print(f"Error setting up data pipeline: {e}")
+        sys.exit(1)
+
+    if not preprocess_exists:
+        print("\nRunning subprocess for preprocessing...")
+        cmd = ["python", "preprocess.py"]
+        if config_name:
+            cmd.extend(["--config", config_name])
+        
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            print("Subprocess finished successfully.")
+        except FileNotFoundError:
+            print("Error: 'python' command not found. Ensure Python is in your PATH.")
+            sys.exit(1)
+        except subprocess.CalledProcessError as e:
+            print(f"--- Preprocessing Subprocess Failed ---")
+            print(f"Command: {' '.join(e.cmd)}")
+            print(f"Return Code: {e.returncode}")
+            print(f"Output:\n{e.stdout}")
+            print(f"Error:\n{e.stderr}")
+            sys.exit(1)
+
+    return preprocess_dir
+
+
+def create_dataset_and_dataloader(preprocess_dir, train_params):
+    """Create dataset and dataloader."""
+    try:
+        dataset = Dataset(preprocess_dir)
+        if len(dataset) == 0:
+            print(f"Error: Preprocessed dataset in {preprocess_dir} is empty!")
+            sys.exit(1)
+
+        dataloader = torch.utils.data.DataLoader(
+            dataset, 
+            train_params['batch_size'], 
+            shuffle=True, 
+            drop_last=True,
+            num_workers=train_params['num_workers'],
+            pin_memory=train_params['pin_memory'] if torch.cuda.is_available() else False,
+            persistent_workers=True if train_params['num_workers'] > 0 else False
+        )
+        
+        print(f"\nDataset loaded from {preprocess_dir} ({len(dataset)} samples).")
+        return dataset, dataloader
+
+    except FileNotFoundError:
+        print(f"Error: Could not load preprocessed files from {preprocess_dir}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error creating Dataset or DataLoader: {e}")
+        sys.exit(1)
+
+
+def setup_logging(run_dir, svl_active, vpl_active):
+    """Initialize logging systems."""
+    writer = None
+    loss_log_path = None
+    
+    try:
+        writer = SummaryWriter(run_dir, flush_secs=20)
+        loss_log_path = path.join(run_dir, "loss_log.txt")
+        
+        loss_header_parts = ["step", "total_loss", "spectral_loss", "forward_ms", "backward_ms", "total_ms"]
+        if svl_active:
+            loss_header_parts.append("variance_loss")
+        if vpl_active:
+            loss_header_parts.append("violin_physics_loss")
+        
+        loss_header = ",".join(loss_header_parts) + "\n"
+        with open(loss_log_path, "w") as f:
+            f.write(loss_header)
+            
+        print(f"Logging initialized (TensorBoard: {run_dir}, File: {loss_log_path})")
+        return writer, loss_log_path
+    
+    except Exception as e:
+        print(f"Warning: Failed to initialize logging: {e}")
+        return None, None
+
+
+def setup_optimizer_and_scheduler(model, train_params):
+    """Setup optimizer and learning rate scheduler."""
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    
+    if not trainable_params:
+        print("Warning: No trainable parameters found in model!")
+    
+    optimizer = torch.optim.Adam(trainable_params, lr=train_params['initial_lr'])
+    
+    scheduler = get_tensorflow_scheduler(
+        optimizer=optimizer,
+        initial_lr=train_params['initial_lr'],
+        decay_steps=train_params['decay_steps'],
+        decay_rate=train_params['decay_rate'],
+        staircase=train_params['staircase']
+    )
+    
+    return optimizer, scheduler, trainable_params
+
+
+def calculate_loss(mssl, svl, vpl, model_outputs, target_signal, pitch, loudness,
+                  svl_active, vpl_active, svl_threshold, recent_mssl_avg):
+    """Calculate total loss from all components."""
+    predicted_signal = model_outputs['signal'].squeeze(-1)
+    target_for_loss = target_signal.squeeze(-1) if target_signal.dim() > 2 else target_signal
+    
+    spectral_loss = mssl(predicted_signal, target_for_loss)
+    total_loss = spectral_loss
+    
+    variance_loss_value = None
+    violin_physics_loss_value = None
+    svl_applied = False
+    vpl_applied = False
+    
+    if svl_active and model_outputs.get('harmonic_amplitudes') is not None and recent_mssl_avg < svl_threshold:
+        variance_loss_component = svl(model_outputs['harmonic_amplitudes'], pitch, loudness)
+        variance_loss_value = variance_loss_component.item()
+        total_loss = total_loss + variance_loss_component
+        svl_applied = True
+    
+    if vpl_active and model_outputs.get('violin_diagnostics') is not None:
+        violin_physics_component = vpl(
+            model_outputs['violin_diagnostics'],
+            f0_hz=pitch,
+            loudness=loudness
+        )
+        violin_physics_loss_value = violin_physics_component.item()
+        total_loss = total_loss + violin_physics_component
+        vpl_applied = True
+    
+    return total_loss, spectral_loss, variance_loss_value, violin_physics_loss_value, svl_applied, vpl_applied
+
+
+def log_training_metrics(writer, loss_log_path, global_step, total_loss_value, spectral_loss_value,
+                        forward_time, backward_time, total_time, variance_loss_value, 
+                        violin_physics_loss_value, svl_active, vpl_active):
+    """Log metrics to TensorBoard and CSV file."""
+    try:
+        if writer:
+            log_training_step(
+                writer, global_step, total_loss_value, spectral_loss_value,
+                forward_time, backward_time, total_time,
+                variance_loss_value, violin_physics_loss_value
+            )
+
+        if loss_log_path:
+            log_items = [
+                f"{global_step}", f"{total_loss_value:.6f}", f"{spectral_loss_value:.6f}",
+                f"{forward_time*1000:.2f}", f"{backward_time*1000:.2f}", f"{total_time*1000:.2f}"
+            ]
+            if svl_active:
+                log_items.append(f"{variance_loss_value if variance_loss_value is not None else 0.0:.6f}")
+            if vpl_active:
+                log_items.append(f"{violin_physics_loss_value if violin_physics_loss_value is not None else 0.0:.6f}")
+            
+            log_line = ",".join(log_items) + "\n"
+            with open(loss_log_path, "a") as log_f:
+                log_f.write(log_line)
+                
+    except Exception as e:
+        print(f"\nError during logging at step {global_step}: {e}")
+
+
+def save_final_results(model, run_dir, config, dataloader, device, train_params, global_step):
+    """Save final model state and evaluation audio."""
+    try:
+        torch.save(model.state_dict(), path.join(run_dir, "final_state.pth"))
+        print("Saving final evaluation audio...")
+        save_evaluation_audio(
+            model, model.state_dict(), run_dir, config,
+            dataloader, device, "final",
+            num_batches=train_params['save_audio_num_comparisons']
+        )
+    except Exception as e:
+        print(f"Error saving final state/audio: {e}")
+
+
+def print_training_info(config: dict, device: torch.device, steps: int, batch_size: int, 
+                       epochs: int, dataset_size: int, dataloader_size: int):
+    """Prints a summary of the key training configuration settings."""
+    train_config = config.get("train", {})
+    model_config = config.get("model", {})
+    encoder_config = model_config.get("encoder", {})
+    loss_config = config.get("loss", {})
+    violin_model_config = model_config.get("helmholtz", {})
+    violin_loss_config = loss_config.get("violin_physics", {})
+
+    print("\n--- Training Configuration ---")
+    print(f"- Run Name: {train_config.get('name', 'N/A')}")
+    print(f"- Device: {device}")
+    print(f"- Total Steps: {steps:,}")
+    print(f"- Batch Size: {batch_size}")
+    print(f"- Epochs (approx): {epochs}")
+    print(f"- Dataset Size: {dataset_size:,} segments")
+    print(f"- Steps/Epoch: {dataloader_size:,}")
+
+    print("\n--- Audio Settings ---")
+    print(f"- Sampling Rate: {model_config.get('sampling_rate', train_config.get('sampling_rate', 'N/A'))} Hz")
+    print(f"- Signal Length: {model_config.get('signal_length', train_config.get('signal_length', 'N/A'))} samples")
+    print(f"- Block Size: {model_config.get('block_size', train_config.get('block_size', 'N/A'))} samples")
+
+    print("\n--- Learning Rate Schedule ---")
+    print(f"- Scheduler: TensorFlow Exponential Decay")
+    print(f"  - Initial LR: {train_config.get('learning_rate', 0.001):.1e}")
+    print(f"  - Decay Steps: {int(train_config.get('lr_decay_steps', 10000)):,}")
+    print(f"  - Decay Rate: {train_config.get('lr_decay_rate', 0.98)}")
+    print(f"  - Staircase: {train_config.get('lr_staircase', False)}")
+
+    print("\n--- Model Configuration Summary ---")
+    use_violin = bool(violin_model_config.get('use_helmholtz_synthesis', False))
+    print(f"- Synthesis Mode: {'Violin' if use_violin else 'Standard'}")
+    
+    if use_violin:
+        print(f"  - β range: [{violin_model_config.get('β_min', 0.05)}, {violin_model_config.get('β_max', 0.50)}]")
+        print(f"  - α range: [{violin_model_config.get('α_min', -1.0)}, {violin_model_config.get('α_max', 1.0)}]")
+        print(f"  - Notch width: {violin_model_config.get('notch_width', 0.05)}")
+        print(f"  - Residuals: {violin_model_config.get('n_residuals', 10)} (scale: {violin_model_config.get('residual_scale', 0.1)})")
+
+    print(f"- Max Inharmonicity (B_max): {violin_model_config.get('inharmonicity_b_max', 'N/A')}")
+    print(f"- Encoder Used: {bool(encoder_config.get('use_encoder', False))}")
+    print(f"- Resonance Used: {bool(model_config.get('use_resonance', False))} (Type: {model_config.get('resonance_type', 'N/A')})")
+    print(f"- Room Used: {bool(model_config.get('use_room', False))} (Type: {model_config.get('room_type', 'N/A')})")
+
+    print("\n--- Loss Configuration ---")
+    use_svl_config = bool(loss_config.get('use_source_variance', False))
+    svl_active = use_svl_config and not use_violin
+    vpl_weight = float(violin_loss_config.get("weight", 0.0))
+    use_vpl_config_toggle = bool(loss_config.get("use_helmholtz_deviation_loss", True))
+    vpl_active = use_violin and use_vpl_config_toggle and vpl_weight > 0
+
+    print(f"- SVL Active for this Run: {svl_active}")
+    if use_svl_config:
+        print(f"  - SVL Configured Weight: {loss_config.get('source_variance', {}).get('weight', 'N/A')}")
+        print(f"  - SVL Activation Threshold (MSSL): {train_config.get('svl_activation_threshold', 'N/A')}")
+
+    print(f"- Violin Physics Loss Active for this Run: {vpl_active}")
+    if use_violin:
+        print(f"  - VPL Config Toggle: {use_vpl_config_toggle}")
+        print(f"  - VPL Configured Weight: {vpl_weight}")
+        print(f"  - VPL Loss Type: {violin_loss_config.get('residual_loss_type', 'N/A')}")
+    print("-----------------------------")
+
+
+def save_evaluation_audio(model: nn.Module, model_state: dict, run_dir: str, config: dict,
+                          dataloader: torch.utils.data.DataLoader, device: torch.device,
+                          prefix: str, num_batches: int = 1):
+    """Generates and saves evaluation audio with beep separators between original/synthesized pairs."""
+    original_training_state = model.training
+    
+    if model_state:
+        model.load_state_dict(model_state)
+    model.eval()
+
+    model_config = config.get("model", {})
+    encoder_config = model_config.get("encoder", {})
+    train_config = config.get("train", {})
+
+    sampling_rate = int(model_config.get('sampling_rate', train_config.get('sampling_rate', 16000)))
+    beep_duration = 0.1
+    beep_frequency = 1000
+    beep_amplitude = 0.5
+    
+    time_beep = torch.linspace(0, beep_duration, int(beep_duration * float(sampling_rate)), dtype=torch.float32, device='cpu')
+    beep_signal = beep_amplitude * torch.sin(2 * math.pi * beep_frequency * time_beep)
+    beep_signal_np = beep_signal.numpy()
+
+    audio_parts = []
+
+    try:
+        with torch.no_grad():
+            data_iterator = iter(dataloader)
+
+            for i in range(num_batches):
+                try:
+                    signals, pitches, loudness = next(data_iterator)
+                except StopIteration:
+                    if i == 0:
+                        print("Warning: Ran out of evaluation data before processing any segment.")
+                        return
+                    print(f"Warning: Ran out of evaluation data after processing {i} pairs.")
+                    break
+
+                signals_device = signals.to(device)
+                pitches_device = pitches.unsqueeze(-1).to(device)
+                loudness_device = loudness.unsqueeze(-1).to(device)
+
+                audio_input = signals_device if bool(encoder_config.get("use_encoder", False)) else None
+                model_outputs = model(pitches_device, loudness_device, audio=audio_input)
+                synthesized_signal = model_outputs['signal']
+
+                if synthesized_signal is None:
+                    print(f"Warning: Model output signal is None for pair {i+1}, skipping.")
+                    continue
+
+                original_segment = signals[0].cpu().numpy()
+                synthesized_segment = synthesized_signal[0].squeeze(-1).cpu().numpy()
+
+                min_length = min(len(original_segment), len(synthesized_segment))
+                original_segment = original_segment[:min_length]
+                synthesized_segment = synthesized_segment[:min_length]
+                
+                if min_length == 0:
+                    print(f"Warning: Empty segment for pair {i+1}, skipping.")
+                    continue
+
+                audio_parts.append(original_segment)
+                audio_parts.append(beep_signal_np)
+                audio_parts.append(synthesized_segment)
+
+                if i < num_batches - 1:
+                    audio_parts.append(beep_signal_np)
+
+            if not audio_parts:
+                print("Warning: No audio segments were collected for saving.")
+                return
+
+            final_audio = np.concatenate(audio_parts)
+            save_path = path.join(run_dir, f"{prefix}_eval.wav")
+            sf.write(save_path, final_audio, sampling_rate)
+            print(f"Evaluation audio saved to: {save_path}")
+
+    finally:
+        if original_training_state:
+            model.train()
+        else:
+            model.eval()
+
+
+def setup_data_pipeline(config: dict):
+    """Determine dataset paths and check if preprocessed data exists."""
+    if 'data' not in config:
+        config['data'] = {}
+    if 'preprocess' not in config:
+        config['preprocess'] = {}
+    if 'train' not in config:
+        raise ValueError("Missing 'train' section in config.")
+
+    train_cfg = config['train']
+    data_cfg = config['data']
+    prep_cfg  = config['preprocess']
+
+    # Respect the “root + dataset tag” convention.
+    root = str(train_cfg.get("preprocessed_data_dir", "preprocessed"))
+    dataset_tag = data_cfg.get("dataset_name")
+
+    # If no explicit tag, try to infer from data_location relative to "dataset/"
+    data_location = data_cfg.get("data_location")
+    if dataset_tag is None and data_location:
+        try:
+            # Makes "dataset/recordings/berlin" -> "recordings/berlin"
+            after_dataset = data_location.split("dataset/")[1]
+            dataset_tag = after_dataset.strip("/\\")
+        except Exception:
+            pass
+
+    if dataset_tag is None:
+        dataset_tag = "default_dataset"
+
+    preprocess_dir = path.join(root, dataset_tag)
+
+    # Keep these in config for downstream code
+    prep_cfg["out_dir"] = preprocess_dir
+    data_cfg["data_location"] = data_cfg.get("data_location", f"dataset/{dataset_tag}")
+    data_cfg["extension"] = data_cfg.get("extension", "wav")
+
+    required_files = ["signals.npy", "pitches.npy", "loudness.npy"]
+    has_all = all(path.exists(path.join(preprocess_dir, f)) for f in required_files)
+
+    if not has_all:
+        print(f"\nPreprocessed files not found in {preprocess_dir}")
+        makedirs(preprocess_dir, exist_ok=True)
+        return preprocess_dir, False
+    else:
+        print(f"\nUsing existing preprocessed files from {preprocess_dir}")
+        return preprocess_dir, True
+
+
+
+def log_training_step(writer: SummaryWriter, step: int, total_loss: float, spectral_loss: float,
+                     forward_time: float, backward_time: float, total_time: float,
+                     variance_loss_value: float | None = None,
+                     violin_physics_loss_value: float | None = None):
+    """Logs training metrics for a single step to TensorBoard."""
+    writer.add_scalar("Loss/Total", total_loss, step)
+    writer.add_scalar("Loss/Spectral", spectral_loss, step)
+
+    if variance_loss_value is not None:
+        writer.add_scalar("Loss/Variance", variance_loss_value, step)
+
+    if violin_physics_loss_value is not None:
+        writer.add_scalar("Loss/ViolinPhysics", violin_physics_loss_value, step)
+
+    writer.add_scalar("Time/Forward_ms", forward_time * 1000, step)
+    writer.add_scalar("Time/Backward_ms", backward_time * 1000, step)
+    writer.add_scalar("Time/Total_ms", total_time * 1000, step)
+
+
+def format_progress_dict(epoch: int, spectral_loss_val: float, total_loss_val: float,
+                         avg_mssl_loss: float, learning_rate: float,
+                         variance_loss_value: float | None = None,
+                         violin_physics_loss_value: float | None = None) -> dict:
+    """Creates a dictionary for displaying progress in the tqdm progress bar."""
+    progress_dict = {
+        'Epoch': epoch + 1,
+        'MSSL': f'{spectral_loss_val:.4f}',
+        'Total': f'{total_loss_val:.4f}',
+        'AvgMSSL': f'{avg_mssl_loss:.4f}',
+        'LR': f'{learning_rate:.2e}',
+    }
+    
+    if variance_loss_value is not None:
+        progress_dict['SVL'] = f'{variance_loss_value:.4f}'
+
+    if violin_physics_loss_value is not None:
+        progress_dict['VPL'] = f'{violin_physics_loss_value:.4f}'
+
+    return progress_dict
+--- ./ddsp_torch/model.py ---
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Dict, Any, Optional
+
+from .core import exp_sigmoid, remove_above_nyquist, scale_f0_hz, scale_db
+from .synth import harmonic_synth, filtered_noise_synth
+from .encoder import Encoder
+from .decoder import Decoder
+from .model_utils import (
+    F0_SCALED, LD_SCALED, Z, AMPS, HARMONIC_DISTRIBUTION, NOISE_MAGNITUDES,
+    BOW_POSITION_RAW, NOTCH_DEPTH_RAW, BRIGHTNESS_RAW, RESIDUALS_RAW,
+    INHARMONICITY_COEFF,
+    count_parameters, create_filter, get_inharmonicity_coefficient,
+    print_model_summary, activate_bow_position, activate_notch_depth,
+    activate_brightness, activate_residuals, physics_harmonic_composer
+)
+
+
+class DDSP(nn.Module):
+    """Dual-mode DDSP model supporting standard and violin (physics-guided) synthesis."""
+
+    def __init__(self, **config):
+        super().__init__()
+        self.model_config = config
+        self.encoder_config = config.get("encoder", {})
+        self.decoder_config = config["decoder"]
+
+        self.use_inharmonicity = bool(config.get("use_inharmonicity", True))
+        
+        self.resonance_position = config.get("resonance_position", "before_noise")
+        if self.resonance_position not in ["before_noise", "after_noise"]:
+            raise ValueError(f"resonance_position must be 'before_noise' or 'after_noise', got {self.resonance_position}")
+        
+        helmholtz_config = config.get("helmholtz", {})
+        self.use_helmholtz = bool(helmholtz_config.get("use_helmholtz_synthesis", False))
+        
+        if self.use_helmholtz:
+            self.β_min = float(helmholtz_config.get("β_min", 0.05))
+            self.β_max = float(helmholtz_config.get("β_max", 0.50))
+            self.α_min = float(helmholtz_config.get("α_min", -1.0))
+            self.α_max = float(helmholtz_config.get("α_max", 1.0))
+            self.notch_width = float(helmholtz_config.get("notch_width", 0.05))
+            self.n_residuals = int(helmholtz_config.get("n_residuals", 10))
+            self.residual_scale = float(helmholtz_config.get("residual_scale", 1.0))
+            self.inharmonicity_b_max = float(helmholtz_config.get("inharmonicity_b_max", 0.0005))
+            self.violin_config = {
+                'β_min': self.β_min,
+                'β_max': self.β_max,
+                'α_min': self.α_min,
+                'α_max': self.α_max,
+                'notch_width': self.notch_width,
+                'n_residuals': self.n_residuals,
+                'residual_scale': self.residual_scale
+            }
+        else:
+            self.violin_config = {}
+
+        self.register_buffer("sampling_rate", torch.tensor(float(config["sampling_rate"])))
+        self.register_buffer("block_size", torch.tensor(int(config["block_size"])))
+        self.register_buffer("noise_bias", torch.tensor(float(self.decoder_config.get("noise_bias", -5.0))))
+
+        self.n_harmonic = int(self.decoder_config["n_harmonic"])
+        n_bands = int(self.decoder_config["n_bands"])
+
+        self._initialize_encoder()
+        self._initialize_decoder(n_bands)
+        self._initialize_filters()
+        
+        if hasattr(self, 'resonance') and self.resonance is not None:
+            print(f"- Resonance Position: {self.resonance_position}")
+        
+        print_model_summary(
+            self.encoder, self.decoder, self.resonance, self.room,
+            self.use_helmholtz, self.violin_config, self.use_inharmonicity
+        )
+
+    def _initialize_encoder(self):
+        """Initialize encoder if configured."""
+        use_encoder = bool(self.encoder_config.get("use_encoder", False))
+        
+        if use_encoder:
+            signal_length = int(self.model_config.get("signal_length", 64000))
+            block_size_val = int(self.block_size.item())
+            if block_size_val <= 0:
+                raise ValueError("block_size must be positive")
+            
+            target_length = signal_length // block_size_val
+            self.encoder = Encoder(
+                rnn_channels=int(self.encoder_config["rnn_channels"]),
+                z_dims=int(self.encoder_config["z_dims"]),
+                z_time_steps=int(self.encoder_config["z_time_steps"]),
+                sample_rate=int(self.sampling_rate.item()),
+                target_length=target_length,
+                mfcc_config=self.encoder_config.get("mfcc")
+            )
+        else:
+            self.encoder = None
+
+    def _initialize_decoder(self, n_bands):
+        """Initialize decoder with dynamic output structure."""
+        n_residuals = self.n_residuals if self.use_helmholtz else 10
+
+        decoder_inputs = [F0_SCALED, LD_SCALED]
+        if self.encoder is not None:
+            decoder_inputs.append(Z)
+
+        self.decoder = Decoder(
+            inputs=decoder_inputs,
+            z_dims=int(self.encoder_config.get("z_dims")) if self.encoder and self.encoder_config.get("z_dims") else None,
+            rnn_channels=int(self.decoder_config["rnn_channels"]),
+            ch=int(self.decoder_config["ch"]),
+            layers_per_stack=int(self.decoder_config["layers_per_stack"]),
+            use_helmholtz_config=self.use_helmholtz,
+            use_inharmonicity_config=self.use_inharmonicity,
+            n_harmonic_config=self.n_harmonic,
+            n_bands_config=n_bands,
+            n_residuals_config=n_residuals
+        )
+
+    def _initialize_filters(self):
+        """Initialize resonance and room filters if configured."""
+        self.resonance = self._create_filter("resonance", self.model_config.get("use_resonance", False))
+        self.room = self._create_filter("room", self.model_config.get("use_room", False))
+
+    def _create_filter(self, filter_name, use_filter):
+        """Create a filter of the specified type."""
+        if not use_filter:
+            return None
+
+        filter_type = str(self.model_config.get(f"{filter_name}_type", "ar"))
+        return create_filter(filter_name, filter_type, self.model_config)
+
+    def forward(self, pitch: torch.Tensor, loudness: torch.Tensor, audio: torch.Tensor | None = None) -> Dict[str, torch.Tensor | None]:
+        if pitch.dim() == 2:
+            pitch = pitch.unsqueeze(-1)
+        if loudness.dim() == 2:
+            loudness = loudness.unsqueeze(-1)
+
+        pitch_scaled = scale_f0_hz(pitch)
+        loudness_scaled = scale_db(loudness)
+        decoder_inputs = {F0_SCALED: pitch_scaled, LD_SCALED: loudness_scaled}
+
+        if self.encoder is not None:
+            if audio is None:
+                raise ValueError("Audio input required for encoder")
+            if audio.dim() == 3 and audio.shape[-1] == 1:
+                audio = audio.squeeze(-1)
+            elif audio.dim() != 2:
+                raise ValueError(f"Expected audio [B, L], got {audio.shape}")
+            
+            z_latent = self.encoder(audio)
+            decoder_inputs[Z] = z_latent
+
+        synthesis_params = self.decoder(**decoder_inputs)
+
+        total_amplitude = exp_sigmoid(synthesis_params[AMPS])
+        noise_magnitudes = exp_sigmoid(synthesis_params[NOISE_MAGNITUDES] + self.noise_bias)
+
+        inharmonicity_coeff = get_inharmonicity_coefficient(
+            synthesis_params, pitch, self.use_inharmonicity, 
+            self.inharmonicity_b_max if self.use_helmholtz else 0.0005
+        )
+
+        harmonic_signal, output_data = self._generate_harmonic_component(
+            synthesis_params, pitch, total_amplitude, inharmonicity_coeff
+        )
+
+        if self.resonance is not None and self.resonance_position == "before_noise":
+            harmonic_signal = self.resonance(harmonic_signal)
+
+        noise_component = filtered_noise_synth(noise_magnitudes, int(self.block_size.item()))
+        
+        combined_signal = harmonic_signal + noise_component
+
+        if self.resonance is not None and self.resonance_position == "after_noise":
+            combined_signal = self.resonance(combined_signal)
+
+        if self.room is not None:
+            final_signal = self.room(combined_signal)
+        else:
+            final_signal = combined_signal
+
+        if final_signal.dim() == 2:
+            final_signal = final_signal.unsqueeze(-1)
+
+        output_data['signal'] = final_signal
+        return output_data
+
+    def _generate_harmonic_component(self, synthesis_params, pitch, total_amplitude, inharmonicity_coeff):
+        """Generate harmonic component based on synthesis mode."""
+        sampling_rate = int(self.sampling_rate.item())
+        block_size = int(self.block_size.item())
+
+        if self.use_helmholtz:
+            return self._generate_violin_harmonic(
+                synthesis_params, pitch, total_amplitude, inharmonicity_coeff, sampling_rate, block_size
+            )
+        else:
+            return self._generate_standard_harmonic(
+                synthesis_params, pitch, total_amplitude, inharmonicity_coeff, sampling_rate, block_size
+            )
+
+    def _generate_violin_harmonic(self, synthesis_params, pitch, total_amplitude, inharmonicity_coeff, sampling_rate, block_size):
+        """Generate harmonic component using violin (physics-guided) synthesis."""
+        if BOW_POSITION_RAW not in synthesis_params:
+            raise RuntimeError(f"'{BOW_POSITION_RAW}' expected from Decoder.")
+
+        β = activate_bow_position(synthesis_params[BOW_POSITION_RAW], self.β_min, self.β_max)
+        γ = activate_notch_depth(synthesis_params[NOTCH_DEPTH_RAW])
+        α = activate_brightness(synthesis_params[BRIGHTNESS_RAW], self.α_min, self.α_max)
+        residuals = activate_residuals(synthesis_params[RESIDUALS_RAW], self.residual_scale)
+
+        magnitudes_normalized, diagnostics = physics_harmonic_composer(
+            β=β,
+            γ=γ,
+            α=α,
+            residuals=residuals,
+            B=inharmonicity_coeff,
+            pitch=pitch,
+            n_harmonic=self.n_harmonic,
+            notch_width=self.notch_width,
+            sampling_rate=float(sampling_rate)
+        )
+
+        harmonic_signal = harmonic_synth(
+            pitch_frames=pitch,
+            amplitudes_dist_normalized_frames=magnitudes_normalized,
+            total_amp_frames=total_amplitude,
+            sampling_rate=sampling_rate,
+            block_size=block_size,
+            inharmonicity_coeff_frames=inharmonicity_coeff
+        )
+
+        return harmonic_signal, {'violin_diagnostics': diagnostics}
+
+    def _generate_standard_harmonic(self, synthesis_params, pitch, total_amplitude, inharmonicity_coeff, sampling_rate, block_size):
+        """Generate harmonic component using standard DDSP synthesis."""
+        if HARMONIC_DISTRIBUTION not in synthesis_params:
+            raise RuntimeError(f"'{HARMONIC_DISTRIBUTION}' expected from Decoder.")
+
+        harmonic_amplitudes = exp_sigmoid(synthesis_params[HARMONIC_DISTRIBUTION])
+        harmonic_amplitudes = remove_above_nyquist(
+            harmonic_amplitudes, pitch, float(sampling_rate), inharmonicity_coeff
+        )
+        
+        amplitude_sum = harmonic_amplitudes.sum(-1, keepdim=True)
+        normalized_amplitudes = harmonic_amplitudes / (amplitude_sum + 1e-7)
+
+        harmonic_signal = harmonic_synth(
+            pitch_frames=pitch,
+            amplitudes_dist_normalized_frames=normalized_amplitudes,
+            total_amp_frames=total_amplitude,
+            sampling_rate=sampling_rate,
+            block_size=block_size,
+            inharmonicity_coeff_frames=inharmonicity_coeff
+        )
+
+        return harmonic_signal, {'harmonic_amplitudes': normalized_amplitudes}
+--- ./ddsp_torch/losses.py ---
+
+import torch
+import torch.nn as nn
+from .core import multiscale_fft, safe_log, hz_to_midi, scale_db
+
+def _create_frame_validity_mask(f0_hz, loudness, pitch_threshold, loudness_threshold):
+    """Creates a boolean mask to select frames that are above pitch and loudness thresholds."""
+    loudness_scaled = scale_db(loudness.squeeze(-1))
+    f0_squeezed = f0_hz.squeeze(-1)
+    
+    valid_mask = torch.logical_and(
+        loudness_scaled > loudness_threshold,
+        f0_squeezed > pitch_threshold
+    )
+    return valid_mask
+
+class MultiScaleSTFTLoss(nn.Module):
+    """Multi-scale STFT loss for perceptual audio reconstruction."""
+    
+    def __init__(self, scales, overlap):
+        super().__init__()
+        self.scales = scales
+        self.overlap = overlap
+
+    def forward(self, predicted, target):
+        target_stft_mags = multiscale_fft(target, self.scales, self.overlap)
+        predicted_stft_mags = multiscale_fft(predicted, self.scales, self.overlap)
+
+        total_loss = 0.0
+        for target_mag, predicted_mag in zip(target_stft_mags, predicted_stft_mags):
+            linear_loss = (target_mag - predicted_mag).abs().mean()
+            log_loss = (safe_log(target_mag) - safe_log(predicted_mag)).abs().mean()
+            total_loss = total_loss + linear_loss + log_loss
+
+        return total_loss
+
+class SourceVarianceLoss(nn.Module):
+    """Variance regularization loss for harmonic amplitudes in standard DDSP mode."""
+    
+    def __init__(self, weight=1.0, loudness_threshold=0.2, pitch_threshold=20.0,
+                 distribution_type='var', power_type='pwr', per_pitch=False,
+                 normalize_metrics=True, epsilon=1e-8, n_harmonics=10):
+        super().__init__()
+        self.weight = weight
+        self.loudness_threshold = loudness_threshold
+        self.pitch_threshold = pitch_threshold
+        self.distribution_type = distribution_type
+        self.power_type = power_type
+        self.per_pitch = per_pitch
+        self.normalize_metrics = normalize_metrics
+        self.epsilon = epsilon
+        self.n_harmonics = n_harmonics
+
+    def forward(self, harmonic_distribution, f0_hz, loudness):
+        if harmonic_distribution is None:
+            device = self._get_device(f0_hz, loudness)
+            return torch.tensor(0.0, device=device)
+
+        valid_mask = _create_frame_validity_mask(f0_hz, loudness, self.pitch_threshold, self.loudness_threshold)
+        
+        valid_harmonics = harmonic_distribution[valid_mask]
+
+        if valid_harmonics.numel() == 0:
+            return torch.tensor(0.0, device=harmonic_distribution.device)
+
+        if self.n_harmonics is not None and self.n_harmonics < valid_harmonics.shape[-1]:
+            valid_harmonics = valid_harmonics[:, :self.n_harmonics]
+
+        if self.power_type == 'pwr':
+            harmonics_for_metric = valid_harmonics.pow(2)
+        else:
+            harmonics_for_metric = valid_harmonics
+
+        if self.distribution_type == 'std':
+            metric = torch.std(harmonics_for_metric, dim=0)
+        else:
+            metric = torch.var(harmonics_for_metric, dim=0)
+
+        if self.normalize_metrics:
+            mean_values = torch.mean(harmonics_for_metric, dim=0)
+            if self.distribution_type == 'var':
+                metric = metric / ((mean_values + self.epsilon) ** 2)
+            else:
+                metric = metric / (mean_values + self.epsilon)
+
+        loss = metric.sum()
+        return self.weight * loss
+
+    def _get_device(self, f0_hz, loudness):
+        if f0_hz is not None: return f0_hz.device
+        elif loudness is not None: return loudness.device
+        else: return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+class ViolinPhysicsLoss(nn.Module):
+    """Regularization loss for violin mode physics parameters."""
+    
+    def __init__(self, weight=0.1, weight_β=0.01, weight_α=0.01, weight_γ=0.01, 
+                 weight_B=0.01, weight_residuals=0.01, residual_loss_type="l1",
+                 use_activation_filter: bool = True, loudness_threshold: float = 0.2, 
+                 pitch_threshold: float = 20.0):
+        super().__init__()
+        self.weight = weight
+        self.weight_β = weight_β
+        self.weight_α = weight_α
+        self.weight_γ = weight_γ
+        self.weight_B = weight_B
+        self.weight_residuals = weight_residuals
+        self.residual_loss_type = residual_loss_type
+        
+        self.use_activation_filter = use_activation_filter
+        self.loudness_threshold = loudness_threshold
+        self.pitch_threshold = pitch_threshold
+        
+        if residual_loss_type not in ["l1", "l2"]:
+            raise ValueError(f"residual_loss_type must be 'l1' or 'l2', got {residual_loss_type}")
+
+    def forward(self, diagnostics, f0_hz=None, loudness=None):
+        if diagnostics is None or not diagnostics:
+            return torch.tensor(0.0, device=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+        
+        if self.use_activation_filter:
+            if f0_hz is None or loudness is None:
+                raise ValueError("f0_hz and loudness must be provided for activation filtering.")
+            valid_mask = _create_frame_validity_mask(f0_hz, loudness, self.pitch_threshold, self.loudness_threshold)
+            
+            if not torch.any(valid_mask):
+                return torch.tensor(0.0, device=diagnostics['β'].device)
+        else:
+            valid_mask = None
+        
+        total_loss = 0.0
+        
+        β = diagnostics['β']
+        γ = diagnostics['γ']
+        α = diagnostics['α']
+        B = diagnostics['B']
+        residuals = diagnostics['residuals']
+        
+        if β.shape[1] > 1:
+            Δβ = β[:, 1:] - β[:, :-1]
+            Δα = α[:, 1:] - α[:, :-1]
+            Δγ = γ[:, 1:] - γ[:, :-1]
+            ΔB = B[:, 1:] - B[:, :-1]
+            
+            if valid_mask is not None:
+                valid_mask_diff = valid_mask[:, 1:] & valid_mask[:, :-1]
+                
+                if torch.any(valid_mask_diff):
+                    total_loss += self.weight_β * (Δβ[valid_mask_diff] ** 2).mean()
+                    total_loss += self.weight_α * (Δα[valid_mask_diff] ** 2).mean()
+                    total_loss += self.weight_γ * (Δγ[valid_mask_diff] ** 2).mean()
+                    total_loss += self.weight_B * (ΔB[valid_mask_diff] ** 2).mean()
+            else:
+                total_loss += self.weight_β * (Δβ ** 2).mean()
+                total_loss += self.weight_α * (Δα ** 2).mean()
+                total_loss += self.weight_γ * (Δγ ** 2).mean()
+                total_loss += self.weight_B * (ΔB ** 2).mean()
+        
+        deviation_from_neutral = torch.abs(residuals - 1.0)
+        
+        if self.residual_loss_type == "l2":
+            deviation_from_neutral = deviation_from_neutral ** 2
+        
+        if valid_mask is not None:
+            residuals_expanded = residuals.expand(-1, -1, residuals.shape[-1])
+            valid_mask_expanded = valid_mask.unsqueeze(-1).expand_as(residuals_expanded)
+            
+            if torch.any(valid_mask_expanded):
+                residual_loss = deviation_from_neutral[valid_mask_expanded].mean()
+                total_loss += self.weight_residuals * residual_loss
+        else:
+            total_loss += self.weight_residuals * deviation_from_neutral.mean()
+        
+        return self.weight * total_loss
+--- ./ddsp_torch/filters.py ---
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchaudio.functional import lfilter
+from .dsp import fft_convolve, frequency_to_impulse_response
+from .filter_utils import reflection_to_ar
+
+
+class ConvolutionalFilter(nn.Module):
+    """Applies a learned finite impulse response filter using FFT convolution."""
+    
+    def __init__(self, length, add_dry=True, mask_ir=True, normalization_type=None, 
+                 n_fft=2048, psd_prior="pink", psd_ema_alpha=0.99):
+        super().__init__()
+        self.length = length
+        self.add_dry = add_dry
+        self.mask_ir = mask_ir
+        self.normalization_type = normalization_type
+        self.n_fft = n_fft
+        self.psd_ema_alpha = psd_ema_alpha
+        self.ir = nn.Parameter(torch.randn(length) * 1e-6)
+        
+        if normalization_type == "psd_weighted_rms":
+            self._initialize_spectrum_prior(psd_prior)
+
+    def _initialize_spectrum_prior(self, psd_prior):
+        """Initialize expected input power spectrum."""
+        freqs = torch.fft.rfftfreq(self.n_fft)[1:]
+        if psd_prior == "pink":
+            S_x = 1.0 / (freqs + 1e-3)
+        elif psd_prior == "white":
+            S_x = torch.ones_like(freqs)
+        else:
+            S_x = 1.0 / (freqs + 1e-3)
+        S_x = S_x / S_x.sum()
+        self.register_buffer('S_x', S_x)
+
+    def _update_spectrum_estimate(self, x):
+        """Update running estimate of input PSD from batch."""
+        if not self.training or self.normalization_type != "psd_weighted_rms":
+            return
+        X = torch.fft.rfft(x, n=self.n_fft, dim=-1)
+        batch_psd = (X.abs() ** 2).mean(dim=0)[1:]
+        batch_psd = batch_psd / (batch_psd.sum() + 1e-8)
+        with torch.no_grad():
+            self.S_x.data = self.psd_ema_alpha * self.S_x.data + (1 - self.psd_ema_alpha) * batch_psd
+
+    def _normalize_rms(self, ir):
+        """Apply simple RMS energy normalization."""
+        energy = torch.sqrt((ir ** 2).sum(dim=-1, keepdim=True))
+        return ir / (energy + 1e-8)
+
+    def _normalize_psd_weighted(self, ir):
+        """Apply PSD-weighted RMS normalization."""
+        H = torch.fft.rfft(ir, n=self.n_fft)
+        H_mag_sq = (H.abs() ** 2)[:, 1:]
+        S_x = self.S_x.unsqueeze(0)
+        numerator = S_x.sum(dim=-1, keepdim=True)
+        denominator = (H_mag_sq * S_x).sum(dim=-1, keepdim=True)
+        alpha = torch.sqrt(numerator / (denominator + 1e-8))
+        return ir * alpha.unsqueeze(-1)
+
+    def _apply_normalization(self, ir):
+        """Apply selected normalization type."""
+        if self.normalization_type == "rms":
+            return self._normalize_rms(ir)
+        elif self.normalization_type == "psd_weighted_rms":
+            return self._normalize_psd_weighted(ir)
+        return ir
+
+    def mask_dry_ir(self, ir):
+        """Forces the first tap (direct gain) of the IR to zero."""
+        if len(ir.shape) == 1:
+            ir = ir.unsqueeze(0)
+        dry_mask = torch.zeros((ir.shape[0], 1), device=ir.device)
+        return torch.cat([dry_mask, ir[:, 1:]], dim=1)
+
+    def match_dimensions(self, audio, ir):
+        """Ensures IR has batch dimension matching audio."""
+        if len(ir.shape) == 1:
+            ir = ir.unsqueeze(0)
+        return ir.repeat(audio.shape[0], 1)
+
+    def forward(self, x):
+        original_shape = x.shape
+        if len(x.shape) == 3:
+            x = x.squeeze(-1)
+
+        if self.normalization_type == "psd_weighted_rms":
+            self._update_spectrum_estimate(x)
+
+        ir = self.match_dimensions(x, self.ir)
+        ir = self._apply_normalization(ir)
+        
+        if self.mask_ir:
+            ir = self.mask_dry_ir(ir)
+
+        wet_signal = fft_convolve(x, ir, delay_compensation=0)
+        output = wet_signal + x if self.add_dry else wet_signal
+
+        if len(original_shape) == 3:
+            output = output.unsqueeze(-1)
+        return output
+
+    def build_impulse(self, apply_window=False):
+        """Returns the learned impulse response, optionally windowed."""
+        if apply_window:
+            window = torch.hann_window(len(self.ir), device=self.ir.device)
+            return self.ir * window
+        return self.ir
+
+
+class ARFilter(nn.Module):
+    """Autoregressive filter using reflection coefficients for guaranteed stability."""
+    
+    def __init__(self, lpc_order=16, window_size=4096, add_dry=False, max_reflection=0.999, normalization_type=None):
+        super().__init__()
+
+        self.reflection_coeffs = nn.Parameter(torch.zeros(lpc_order))
+        self.gain = nn.Parameter(torch.ones(1) * 0.1)
+        self.max_reflection = max_reflection
+        self.normalization_type = normalization_type
+
+        window = torch.hann_window(window_size)
+        self.register_buffer('_kernel', torch.diag(window).unsqueeze(1), persistent=False)
+
+        self.add_dry = add_dry
+        self.window_size = window_size
+        self.hop_length = window_size // 4
+
+    def reflection_to_direct(self, k):
+        """Converts reflection coefficients to direct AR coefficients."""
+        full_coeffs = reflection_to_ar(k)
+        return full_coeffs[1:]
+
+    def _apply_gain_normalization(self):
+        """Normalize gain to achieve unit energy impulse response."""
+        if self.normalization_type != "rms":
+            return 1.0
+        with torch.no_grad():
+            k = self.max_reflection * torch.tanh(self.reflection_coeffs)
+            ar_coeffs = self.reflection_to_direct(k)
+            a_coeffs = torch.cat([torch.ones(1, device=ar_coeffs.device), ar_coeffs])
+            b_coeffs = torch.zeros_like(a_coeffs)
+            b_coeffs[0] = self.gain
+            impulse = torch.zeros(self.window_size, device=self.reflection_coeffs.device)
+            impulse[0] = 1.0
+            impulse_response = lfilter(impulse, a_coeffs, b_coeffs)
+            energy = torch.sqrt((impulse_response ** 2).sum())
+            scale = 1.0 / (energy + 1e-8)
+        return scale
+
+    def forward(self, x):
+        original_shape = x.shape
+        if len(x.shape) == 3:
+            x = x.squeeze(-1)
+
+        batch_size, signal_length = x.shape
+
+        k = self.max_reflection * torch.tanh(self.reflection_coeffs)
+        ar_coeffs = self.reflection_to_direct(k)
+        a_coeffs = torch.cat([torch.ones(1, device=ar_coeffs.device), ar_coeffs])
+
+        gain_scale = self._apply_gain_normalization()
+        b_coeffs = torch.zeros_like(a_coeffs)
+        b_coeffs[0] = self.gain * gain_scale
+
+        output = self._process_with_overlap_add(x, a_coeffs, b_coeffs, signal_length)
+
+        if self.add_dry:
+            output = output + x
+
+        if len(original_shape) == 3:
+            output = output.unsqueeze(-1)
+
+        return output
+
+    def _process_with_overlap_add(self, x, a_coeffs, b_coeffs, signal_length):
+        """Process signal using overlap-add with IIR filtering."""
+        padding = self.window_size // 2
+        x_padded = F.pad(x, (padding, padding), 'constant', 0)
+        unfolded = x_padded.unfold(-1, self.window_size, self.hop_length)
+
+        batch, frames, window = unfolded.shape
+        unfolded_flat = unfolded.reshape(-1, window)
+
+        filtered = lfilter(unfolded_flat, a_coeffs.expand(batch*frames, -1),
+                          b_coeffs.expand(batch*frames, -1))
+
+        filtered = filtered.reshape(batch, frames, window).transpose(1, 2)
+
+        ones = torch.ones(1, filtered.shape[1], filtered.shape[2], device=filtered.device)
+        combined = torch.cat([filtered, ones], dim=0)
+        result = F.conv_transpose1d(
+            combined, self._kernel, stride=self.hop_length, padding=0
+        ).squeeze(1)
+
+        output, normalization = result[:-1], result[-1:]
+        output = output / (normalization + 1e-8)
+
+        if output.shape[1] > signal_length:
+            output = output[:, :signal_length]
+        elif output.shape[1] < signal_length:
+            output = F.pad(output, (0, signal_length - output.shape[1]))
+
+        return output
+
+    def get_impulse_response(self, apply_window=False):
+        """Computes the impulse response of the current AR filter."""
+        k = self.max_reflection * torch.tanh(self.reflection_coeffs)
+        ar_coeffs = self.reflection_to_direct(k)
+        a_coeffs = torch.cat([torch.ones(1, device=ar_coeffs.device), ar_coeffs])
+        
+        b_coeffs = torch.zeros_like(a_coeffs)
+        b_coeffs[0] = self.gain
+
+        impulse = torch.zeros(self.window_size, device=self.reflection_coeffs.device)
+        impulse[0] = 1.0
+
+        impulse_response = lfilter(impulse, a_coeffs, b_coeffs)
+
+        if apply_window:
+            window = self._kernel.squeeze().diag()
+            impulse_response = impulse_response * window[:impulse_response.shape[0]]
+
+        return impulse_response
+
+    def build_impulse(self, apply_window=False):
+        """Interface method for consistency."""
+        return self.get_impulse_response(apply_window=apply_window)
+
+
+class ARMAFilter(nn.Module):
+    """Autoregressive Moving Average filter using reflection coefficients for AR stability."""
+    
+    def __init__(self, ar_order: int = 16, ma_order: int = 16, window_size: int = 4096, add_dry: bool = False, max_reflection: float = 0.999, normalization_type=None):
+        super().__init__()
+
+        self.ar_order = ar_order
+        self.ma_order = ma_order
+        self.add_dry = add_dry
+        self.max_reflection = max_reflection
+        self.normalization_type = normalization_type
+
+        self.ar_reflection_coeffs = nn.Parameter(torch.zeros(ar_order))
+        self.ma_coeffs = nn.Parameter(torch.randn(ma_order) * 1e-4)
+        self.gain = nn.Parameter(torch.ones(1) * 0.1)
+
+        window = torch.hann_window(window_size)
+        self.register_buffer('_kernel', torch.diag(window).unsqueeze(1), persistent=False)
+
+        self.window_size = window_size
+        self.hop_length = window_size // 4
+
+    def reflection_to_ar(self, k):
+        """Converts reflection coefficients to direct AR coefficients."""
+        full_coeffs = reflection_to_ar(k)
+        return full_coeffs[1:]
+
+    def _apply_gain_normalization(self):
+        """Normalize gain to achieve unit energy impulse response."""
+        if self.normalization_type != "rms":
+            return 1.0
+        with torch.no_grad():
+            k = self.max_reflection * torch.tanh(self.ar_reflection_coeffs)
+            ar_coeffs = self.reflection_to_ar(k)
+            a_coeffs = torch.cat([torch.ones(1, device=ar_coeffs.device), ar_coeffs])
+            b_coeffs = torch.cat([self.gain, self.ma_coeffs])
+            impulse = torch.zeros(self.window_size, device=ar_coeffs.device)
+            impulse[0] = 1.0
+            impulse_response = lfilter(impulse, a_coeffs, b_coeffs)
+            energy = torch.sqrt((impulse_response ** 2).sum())
+            scale = 1.0 / (energy + 1e-8)
+        return scale
+
+    def forward(self, x):
+        original_shape = x.shape
+        if len(x.shape) == 3:
+            x = x.squeeze(-1)
+
+        batch_size, signal_length = x.shape
+
+        k = self.max_reflection * torch.tanh(self.ar_reflection_coeffs)
+        ar_coeffs = self.reflection_to_ar(k)
+
+        a_coeffs = torch.cat([torch.ones(1, device=ar_coeffs.device), ar_coeffs])
+        
+        gain_scale = self._apply_gain_normalization()
+        b_coeffs = torch.cat([self.gain * gain_scale, self.ma_coeffs])
+
+        output = self._process_with_overlap_add(x, a_coeffs, b_coeffs, signal_length)
+
+        if self.add_dry:
+            output = output + x
+
+        if len(original_shape) == 3:
+            output = output.unsqueeze(-1)
+
+        return output
+
+    def _process_with_overlap_add(self, x, a_coeffs, b_coeffs, signal_length):
+        """Process signal using overlap-add with ARMA filtering."""
+        padding = self.window_size // 2
+        x_padded = F.pad(x, (padding, padding), 'constant', 0)
+        unfolded = x_padded.unfold(-1, self.window_size, self.hop_length)
+
+        batch, frames, window = unfolded.shape
+        unfolded_flat = unfolded.reshape(-1, window)
+
+        filtered = lfilter(unfolded_flat, a_coeffs.expand(batch*frames, -1),
+                          b_coeffs.expand(batch*frames, -1))
+
+        filtered = filtered.reshape(batch, frames, window).transpose(1, 2)
+
+        ones = torch.ones(1, filtered.shape[1], filtered.shape[2], device=filtered.device)
+        combined = torch.cat([filtered, ones], dim=0)
+        result = F.conv_transpose1d(
+            combined, self._kernel, stride=self.hop_length, padding=0
+        ).squeeze(1)
+
+        output, normalization = result[:-1], result[-1:]
+        output = output / (normalization + 1e-8)
+
+        if output.shape[1] > signal_length:
+            output = output[:, :signal_length]
+        elif output.shape[1] < signal_length:
+            output = F.pad(output, (0, signal_length - output.shape[1]))
+
+        return output
+
+    def build_impulse(self, apply_window=False):
+        """Computes the impulse response of the current ARMA filter."""
+        k = self.max_reflection * torch.tanh(self.ar_reflection_coeffs)
+        ar_coeffs = self.reflection_to_ar(k)
+        a_coeffs = torch.cat([torch.ones(1, device=ar_coeffs.device), ar_coeffs])
+        b_coeffs = torch.cat([self.gain, self.ma_coeffs])
+
+        impulse = torch.zeros(self.window_size, device=ar_coeffs.device)
+        impulse[0] = 1.0
+
+        impulse_response = lfilter(impulse, a_coeffs, b_coeffs)
+
+        if apply_window:
+            window = self._kernel.squeeze().diag()
+            impulse_response = impulse_response * window[:impulse_response.shape[0]]
+
+        return impulse_response
