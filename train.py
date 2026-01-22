@@ -15,8 +15,8 @@ from ddsp_torch.train_util import (
 
 
 def run_training_loop(model, dataloader, optimizer, scheduler, trainable_params, 
-                     mssl, svl, hdl, train_params, config, run_dir, device,
-                     svl_active, hdl_active, writer, loss_log_path):
+                     mssl, svl, vpl, train_params, config, run_dir, device,
+                     svl_active, vpl_active, writer, loss_log_path):
     """Execute the main training loop."""
     recent_mssl_losses = deque(maxlen=train_params['loss_window'])
     step_times = deque(maxlen=train_params['steps'])
@@ -73,9 +73,9 @@ def run_training_loop(model, dataloader, optimizer, scheduler, trainable_params,
                 try:
                     current_mssl_avg = sum(recent_mssl_losses) / len(recent_mssl_losses) if recent_mssl_losses else float('inf')
                     
-                    total_loss, spectral_loss, variance_loss_value, helmholtz_dev_loss_value, svl_applied, hdl_applied = calculate_loss(
-                        mssl, svl, hdl, model_outputs, signals_device, pitches_device, loudness_device,
-                        svl_active, hdl_active, train_params['svl_activation_threshold'], current_mssl_avg
+                    total_loss, spectral_loss, variance_loss_value, violin_physics_loss_value, svl_applied, vpl_applied = calculate_loss(
+                        mssl, svl, vpl, model_outputs, signals_device, pitches_device, loudness_device,
+                        svl_active, vpl_active, train_params['svl_activation_threshold'], current_mssl_avg
                     )
                     
                     recent_mssl_losses.append(spectral_loss.item())
@@ -112,7 +112,7 @@ def run_training_loop(model, dataloader, optimizer, scheduler, trainable_params,
                 log_training_metrics(
                     writer, loss_log_path, global_step, total_loss_value, spectral_loss_value,
                     forward_time, backward_time, total_step_time, variance_loss_value,
-                    helmholtz_dev_loss_value, svl_active, hdl_active
+                    violin_physics_loss_value, svl_active, vpl_active
                 )
 
                 # Progress bar update
@@ -120,7 +120,7 @@ def run_training_loop(model, dataloader, optimizer, scheduler, trainable_params,
                     epoch, spectral_loss_value, total_loss_value, current_mssl_avg,
                     optimizer.param_groups[0]["lr"],
                     variance_loss_value if svl_applied else None,
-                    helmholtz_dev_loss_value if hdl_applied else None
+                    violin_physics_loss_value if vpl_applied else None
                 )
                 pbar.set_postfix(progress_dict)
                 pbar.update(1)
@@ -170,21 +170,21 @@ if __name__ == '__main__':
 
     # Model and loss initialization
     model = initialize_model(config, device)
-    mssl, svl, hdl, svl_active, hdl_active = setup_loss_functions(config, device)
+    mssl, svl, vpl, svl_active, vpl_active = setup_loss_functions(config, device)
 
     # Data pipeline setup
     preprocess_dir = run_preprocessing_if_needed(config, config_name)
     dataset, dataloader = create_dataset_and_dataloader(preprocess_dir, train_params)
 
     # Training infrastructure setup
-    writer, loss_log_path = setup_logging(run_dir, svl_active, hdl_active)
+    writer, loss_log_path = setup_logging(run_dir, svl_active, vpl_active)
     optimizer, scheduler, trainable_params = setup_optimizer_and_scheduler(model, train_params)
 
     # Execute training
     global_step, training_failed, step_times = run_training_loop(
         model, dataloader, optimizer, scheduler, trainable_params,
-        mssl, svl, hdl, train_params, config, run_dir, device,
-        svl_active, hdl_active, writer, loss_log_path
+        mssl, svl, vpl, train_params, config, run_dir, device,
+        svl_active, vpl_active, writer, loss_log_path
     )
 
     # Cleanup and final operations

@@ -1,5 +1,5 @@
 train:
-  name: test
+  name: test_standard_brightness
   root: runs/
   steps: 100
   batch_size: 8
@@ -17,7 +17,7 @@ train:
   preprocessed_data_dir: preprocessed
 
 preprocess:
-  out_dir: preprocessed/physical_model/new/convolved_Bernardel_ear_norm/A
+  out_dir: preprocessed/physical_model/new/convolved_StradCopy_ff_norm/full
   sampling_rate: 16000
   block_size: 64
   signal_length: 64000
@@ -25,16 +25,21 @@ preprocess:
   crepe_model_path: ''
 
 data:
-  data_location: dataset/physical_model/new/convolved_Bernardel_ear_norm/A
+  data_location: dataset/physical_model/new/convolved_StradCopy_ff_norm/full
   extension: wav
-  dataset_name: physical_model/new/convolved_Bernardel_ear_norm/A
+  dataset_name: physical_model/new/convolved_StradCopy_ff_norm/full
 
 model:
   sampling_rate: 16000
   block_size: 64
   signal_length: 64000
   use_inharmonicity: false
-
+  
+  # NEW: Enable brightness tilt for standard mode
+  use_brightness_tilt_standard: true
+  standard_brightness_α_min: -1.0
+  standard_brightness_α_max: 1.0
+  
   encoder:
     use_encoder: true
     rnn_channels: 512
@@ -46,7 +51,7 @@ model:
       f_min: 20.0
       f_max: 8000.0
       log_mels: true
-
+  
   decoder:
     n_harmonic: 60
     n_bands: 65
@@ -54,9 +59,13 @@ model:
     ch: 512
     layers_per_stack: 3
     noise_bias: -5.0
-
+  
   helmholtz:
-    use_helmholtz_synthesis: true
+    use_helmholtz_synthesis: false  # CHANGED: Standard mode
+    use_bow_mask: false
+    use_brightness_mask: true
+    use_residuals_mask: true
+    smooth_bow_notch: false
     "β_min": 0.05
     "β_max": 0.5
     "α_min": -1.0
@@ -65,7 +74,7 @@ model:
     n_residuals: 10
     residual_scale: 1.0
     inharmonicity_b_max: 0.0005
-
+  
   use_resonance: true
   resonance_type: convolutional
   resonance_length: 2048
@@ -76,7 +85,7 @@ model:
   resonance_psd_prior: pink
   resonance_n_fft: 2048
   resonance_psd_ema_alpha: 0.99
-
+  
   use_room: false
   room_type: ar
   room_window_size: 4096
@@ -89,7 +98,7 @@ loss:
   mssl:
     scales: [2048, 1024, 512, 256, 128, 64]
     overlap: 0.75
-
+  
   use_source_variance: false
   source_variance:
     weight: 0.0
@@ -101,10 +110,10 @@ loss:
     normalize_metrics: true
     epsilon: 1.0e-08
     n_harmonics: 10
-
-  use_helmholtz_deviation_loss: true
+  
+  use_helmholtz_deviation_loss: false  # CHANGED: Not applicable in standard mode
   violin_physics:
-    weight: 10.0
+    weight: 1.0
     smoothness_β: 0.0
     smoothness_α: 0.0
     smoothness_γ: 0.0

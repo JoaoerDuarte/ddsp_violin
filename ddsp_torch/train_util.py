@@ -175,6 +175,10 @@ def setup_loss_functions(config, device):
         vpl_active = use_violin_synthesis and use_vpl_config_flag and vpl_weight > 0
 
         if vpl_active:
+            use_bow_mask = bool(helmholtz_config.get("use_bow_mask", True))
+            use_brightness_mask = bool(helmholtz_config.get("use_brightness_mask", True))
+            use_residuals_mask = bool(helmholtz_config.get("use_residuals_mask", True))
+            
             vpl = ViolinPhysicsLoss(
                 weight=vpl_weight,
                 weight_β=float(violin_loss_config.get("smoothness_β", 0.01)),
@@ -185,7 +189,10 @@ def setup_loss_functions(config, device):
                 residual_loss_type=str(violin_loss_config.get("residual_loss_type", "l1")),
                 use_activation_filter=bool(violin_loss_config.get("use_activation_filter", True)),
                 loudness_threshold=float(violin_loss_config.get("loudness_threshold", 0.2)),
-                pitch_threshold=float(violin_loss_config.get("pitch_threshold", 20.0))
+                pitch_threshold=float(violin_loss_config.get("pitch_threshold", 20.0)),
+                use_bow_mask=use_bow_mask,
+                use_brightness_mask=use_brightness_mask,
+                use_residuals_mask=use_residuals_mask
             ).to(device)
             print(f"Violin Physics Loss: Enabled (Weight: {vpl_weight})")
         elif use_violin_synthesis and (not use_vpl_config_flag or vpl_weight <= 0):
@@ -331,7 +338,7 @@ def calculate_loss(mssl, svl, vpl, model_outputs, target_signal, pitch, loudness
     
     if svl_active and model_outputs.get('harmonic_amplitudes') is not None and recent_mssl_avg < svl_threshold:
         variance_loss_component = svl(model_outputs['harmonic_amplitudes'], pitch, loudness)
-        variance_loss_value = variance_loss_component.item()
+        variance_loss_value = variance_loss_component.item() if isinstance(variance_loss_component, torch.Tensor) else float(variance_loss_component)
         total_loss = total_loss + variance_loss_component
         svl_applied = True
     
@@ -341,7 +348,7 @@ def calculate_loss(mssl, svl, vpl, model_outputs, target_signal, pitch, loudness
             f0_hz=pitch,
             loudness=loudness
         )
-        violin_physics_loss_value = violin_physics_component.item()
+        violin_physics_loss_value = violin_physics_component.item() if isinstance(violin_physics_component, torch.Tensor) else float(violin_physics_component)
         total_loss = total_loss + violin_physics_component
         vpl_applied = True
     
@@ -397,7 +404,6 @@ def print_training_info(config: dict, device: torch.device, steps: int, batch_si
     """Prints a summary of the key training configuration settings."""
     train_config = config.get("train", {})
     model_config = config.get("model", {})
-    encoder_config = model_config.get("encoder", {})
     loss_config = config.get("loss", {})
     violin_model_config = model_config.get("helmholtz", {})
     violin_loss_config = loss_config.get("violin_physics", {})
@@ -423,38 +429,27 @@ def print_training_info(config: dict, device: torch.device, steps: int, batch_si
     print(f"  - Decay Rate: {train_config.get('lr_decay_rate', 0.98)}")
     print(f"  - Staircase: {train_config.get('lr_staircase', False)}")
 
-    print("\n--- Model Configuration Summary ---")
-    use_violin = bool(violin_model_config.get('use_helmholtz_synthesis', False))
-    print(f"- Synthesis Mode: {'Violin' if use_violin else 'Standard'}")
-    
-    if use_violin:
-        print(f"  - β range: [{violin_model_config.get('β_min', 0.05)}, {violin_model_config.get('β_max', 0.50)}]")
-        print(f"  - α range: [{violin_model_config.get('α_min', -1.0)}, {violin_model_config.get('α_max', 1.0)}]")
-        print(f"  - Notch width: {violin_model_config.get('notch_width', 0.05)}")
-        print(f"  - Residuals: {violin_model_config.get('n_residuals', 10)} (scale: {violin_model_config.get('residual_scale', 0.1)})")
-
-    print(f"- Max Inharmonicity (B_max): {violin_model_config.get('inharmonicity_b_max', 'N/A')}")
-    print(f"- Encoder Used: {bool(encoder_config.get('use_encoder', False))}")
-    print(f"- Resonance Used: {bool(model_config.get('use_resonance', False))} (Type: {model_config.get('resonance_type', 'N/A')})")
-    print(f"- Room Used: {bool(model_config.get('use_room', False))} (Type: {model_config.get('room_type', 'N/A')})")
-
     print("\n--- Loss Configuration ---")
+    use_violin = bool(violin_model_config.get('use_helmholtz_synthesis', False))
     use_svl_config = bool(loss_config.get('use_source_variance', False))
     svl_active = use_svl_config and not use_violin
     vpl_weight = float(violin_loss_config.get("weight", 0.0))
     use_vpl_config_toggle = bool(loss_config.get("use_helmholtz_deviation_loss", True))
     vpl_active = use_violin and use_vpl_config_toggle and vpl_weight > 0
 
-    print(f"- SVL Active for this Run: {svl_active}")
-    if use_svl_config:
-        print(f"  - SVL Configured Weight: {loss_config.get('source_variance', {}).get('weight', 'N/A')}")
-        print(f"  - SVL Activation Threshold (MSSL): {train_config.get('svl_activation_threshold', 'N/A')}")
+    print(f"- Multi-Scale STFT Loss: Enabled")
+    print(f"  - Scales: {loss_config.get('mssl', {}).get('scales', 'N/A')}")
+    print(f"  - Overlap: {loss_config.get('mssl', {}).get('overlap', 'N/A')}")
+    
+    print(f"- Source Variance Loss: {'Enabled' if svl_active else 'Disabled'}")
+    if svl_active:
+        print(f"  - Weight: {loss_config.get('source_variance', {}).get('weight', 'N/A')}")
+        print(f"  - Activation Threshold (MSSL): {train_config.get('svl_activation_threshold', 'N/A')}")
 
-    print(f"- Violin Physics Loss Active for this Run: {vpl_active}")
-    if use_violin:
-        print(f"  - VPL Config Toggle: {use_vpl_config_toggle}")
-        print(f"  - VPL Configured Weight: {vpl_weight}")
-        print(f"  - VPL Loss Type: {violin_loss_config.get('residual_loss_type', 'N/A')}")
+    print(f"- Violin Physics Loss: {'Enabled' if vpl_active else 'Disabled'}")
+    if vpl_active:
+        print(f"  - Weight: {vpl_weight}")
+        print(f"  - Residual Loss Type: {violin_loss_config.get('residual_loss_type', 'N/A')}")
     print("-----------------------------")
 
 
@@ -556,15 +551,12 @@ def setup_data_pipeline(config: dict):
     data_cfg = config['data']
     prep_cfg  = config['preprocess']
 
-    # Respect the “root + dataset tag” convention.
     root = str(train_cfg.get("preprocessed_data_dir", "preprocessed"))
     dataset_tag = data_cfg.get("dataset_name")
 
-    # If no explicit tag, try to infer from data_location relative to "dataset/"
     data_location = data_cfg.get("data_location")
     if dataset_tag is None and data_location:
         try:
-            # Makes "dataset/recordings/berlin" -> "recordings/berlin"
             after_dataset = data_location.split("dataset/")[1]
             dataset_tag = after_dataset.strip("/\\")
         except Exception:
@@ -575,7 +567,6 @@ def setup_data_pipeline(config: dict):
 
     preprocess_dir = path.join(root, dataset_tag)
 
-    # Keep these in config for downstream code
     prep_cfg["out_dir"] = preprocess_dir
     data_cfg["data_location"] = data_cfg.get("data_location", f"dataset/{dataset_tag}")
     data_cfg["extension"] = data_cfg.get("extension", "wav")

@@ -14,17 +14,23 @@ class Decoder(nn.Module):
     def __init__(self, inputs: list[str], z_dims: int | None = None, rnn_channels: int = 512,
                  ch: int = 512, layers_per_stack: int = 3, use_helmholtz_config: bool = False,
                  use_inharmonicity_config: bool = True, n_harmonic_config: int = 60,
-                 n_bands_config: int = 65, n_residuals_config: int = 10):
+                 n_bands_config: int = 65, n_residuals_config: int = 10,
+                 use_bow_mask: bool = True, use_brightness_mask: bool = True,
+                 use_residuals_mask: bool = True):
         super().__init__()
 
         self.input_names = inputs
+        self.use_bow_mask = use_bow_mask
+        self.use_brightness_mask = use_brightness_mask
+        self.use_residuals_mask = use_residuals_mask
 
         if Z in self.input_names and z_dims is None:
             raise ValueError("z_dims must be provided if Z is in decoder inputs.")
 
         self.output_structure = self._build_output_structure(
             use_helmholtz_config, use_inharmonicity_config, n_harmonic_config,
-            n_bands_config, n_residuals_config
+            n_bands_config, n_residuals_config, use_bow_mask, use_brightness_mask,
+            use_residuals_mask
         )
 
         self.input_stacks = nn.ModuleDict({
@@ -40,17 +46,23 @@ class Decoder(nn.Module):
         total_output_units = sum(size for _, size in self.output_structure)
         self.dense_out = nn.Linear(ch, total_output_units)
 
-    def _build_output_structure(self, use_helmholtz, use_inharmonicity, n_harmonic, n_bands, n_residuals):
+    def _build_output_structure(self, use_helmholtz, use_inharmonicity, n_harmonic, n_bands, 
+                                n_residuals, use_bow_mask, use_brightness_mask, use_residuals_mask):
         """Build output structure based on configuration flags."""
         structure = [(AMPS, 1)]
 
         if use_helmholtz:
-            structure.append((BOW_POSITION_RAW, 1))
-            structure.append((NOTCH_DEPTH_RAW, 1))
-            structure.append((BRIGHTNESS_RAW, 1))
-            structure.append((RESIDUALS_RAW, n_residuals))
+            if use_bow_mask:
+                structure.append((BOW_POSITION_RAW, 1))
+                structure.append((NOTCH_DEPTH_RAW, 1))
+            if use_brightness_mask:
+                structure.append((BRIGHTNESS_RAW, 1))
+            if use_residuals_mask:
+                structure.append((RESIDUALS_RAW, n_residuals))
         else:
             structure.append((HARMONIC_DISTRIBUTION, n_harmonic))
+            if use_brightness_mask:
+                structure.append((BRIGHTNESS_RAW, 1))
 
         if use_inharmonicity:
             structure.append((INHARMONICITY_COEFF, 1))

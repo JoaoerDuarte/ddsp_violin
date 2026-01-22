@@ -44,6 +44,12 @@ class DDSP(nn.Module):
             self.n_residuals = int(helmholtz_config.get("n_residuals", 10))
             self.residual_scale = float(helmholtz_config.get("residual_scale", 1.0))
             self.inharmonicity_b_max = float(helmholtz_config.get("inharmonicity_b_max", 0.0005))
+            
+            self.use_bow_mask = bool(helmholtz_config.get("use_bow_mask", True))
+            self.use_brightness_mask = bool(helmholtz_config.get("use_brightness_mask", True))
+            self.use_residuals_mask = bool(helmholtz_config.get("use_residuals_mask", True))
+            self.smooth_bow_notch = bool(helmholtz_config.get("smooth_bow_notch", True))
+            
             self.violin_config = {
                 'β_min': self.β_min,
                 'β_max': self.β_max,
@@ -51,10 +57,35 @@ class DDSP(nn.Module):
                 'α_max': self.α_max,
                 'notch_width': self.notch_width,
                 'n_residuals': self.n_residuals,
-                'residual_scale': self.residual_scale
+                'residual_scale': self.residual_scale,
+                'use_bow_mask': self.use_bow_mask,
+                'use_brightness_mask': self.use_brightness_mask,
+                'use_residuals_mask': self.use_residuals_mask,
+                'inharmonicity_b_max': self.inharmonicity_b_max
             }
+            
+            self.use_brightness_tilt_standard = False
+            self.brightness_config_standard = {}
         else:
+            self.use_bow_mask = True
+            self.use_brightness_mask = True
+            self.use_residuals_mask = True
             self.violin_config = {}
+            
+            # Standard mode brightness tilt configuration
+            self.use_brightness_tilt_standard = bool(config.get("use_brightness_tilt_standard", False))
+            if self.use_brightness_tilt_standard:
+                # Try to reuse helmholtz α ranges if available, otherwise use defaults
+                self.α_min_standard = float(config.get("standard_brightness_α_min", 
+                                                      helmholtz_config.get("α_min", -1.0)))
+                self.α_max_standard = float(config.get("standard_brightness_α_max",
+                                                      helmholtz_config.get("α_max", 1.0)))
+                self.brightness_config_standard = {
+                    'α_min': self.α_min_standard,
+                    'α_max': self.α_max_standard
+                }
+            else:
+                self.brightness_config_standard = {}
 
         self.register_buffer("sampling_rate", torch.tensor(float(config["sampling_rate"])))
         self.register_buffer("block_size", torch.tensor(int(config["block_size"])))
@@ -67,12 +98,18 @@ class DDSP(nn.Module):
         self._initialize_decoder(n_bands)
         self._initialize_filters()
         
-        if hasattr(self, 'resonance') and self.resonance is not None:
-            print(f"- Resonance Position: {self.resonance_position}")
-        
         print_model_summary(
-            self.encoder, self.decoder, self.resonance, self.room,
-            self.use_helmholtz, self.violin_config, self.use_inharmonicity
+            self.encoder, 
+            self.decoder, 
+            self.resonance, 
+            self.room,
+            self.use_helmholtz, 
+            self.violin_config, 
+            self.use_inharmonicity,
+            use_brightness_standard=self.use_brightness_tilt_standard,
+            brightness_config_standard=self.brightness_config_standard,
+            decoder_output_structure=self.decoder.output_structure,
+            resonance_position=self.resonance_position if self.resonance is not None else None
         )
 
     def _initialize_encoder(self):
@@ -105,6 +142,12 @@ class DDSP(nn.Module):
         if self.encoder is not None:
             decoder_inputs.append(Z)
 
+        # Determine if decoder should output brightness based on mode
+        if self.use_helmholtz:
+            decoder_use_brightness = self.use_brightness_mask
+        else:
+            decoder_use_brightness = self.use_brightness_tilt_standard
+
         self.decoder = Decoder(
             inputs=decoder_inputs,
             z_dims=int(self.encoder_config.get("z_dims")) if self.encoder and self.encoder_config.get("z_dims") else None,
@@ -115,7 +158,10 @@ class DDSP(nn.Module):
             use_inharmonicity_config=self.use_inharmonicity,
             n_harmonic_config=self.n_harmonic,
             n_bands_config=n_bands,
-            n_residuals_config=n_residuals
+            n_residuals_config=n_residuals,
+            use_bow_mask=self.use_bow_mask,
+            use_brightness_mask=decoder_use_brightness,
+            use_residuals_mask=self.use_residuals_mask
         )
 
     def _initialize_filters(self):
@@ -203,13 +249,27 @@ class DDSP(nn.Module):
 
     def _generate_violin_harmonic(self, synthesis_params, pitch, total_amplitude, inharmonicity_coeff, sampling_rate, block_size):
         """Generate harmonic component using violin (physics-guided) synthesis."""
-        if BOW_POSITION_RAW not in synthesis_params:
-            raise RuntimeError(f"'{BOW_POSITION_RAW}' expected from Decoder.")
-
-        β = activate_bow_position(synthesis_params[BOW_POSITION_RAW], self.β_min, self.β_max)
-        γ = activate_notch_depth(synthesis_params[NOTCH_DEPTH_RAW])
-        α = activate_brightness(synthesis_params[BRIGHTNESS_RAW], self.α_min, self.α_max)
-        residuals = activate_residuals(synthesis_params[RESIDUALS_RAW], self.residual_scale)
+        batch_size = pitch.shape[0]
+        time_steps = pitch.shape[1]
+        device = pitch.device
+        dtype = pitch.dtype
+        
+        if BOW_POSITION_RAW in synthesis_params:
+            β = activate_bow_position(synthesis_params[BOW_POSITION_RAW], self.β_min, self.β_max)
+            γ = activate_notch_depth(synthesis_params[NOTCH_DEPTH_RAW])
+        else:
+            β = torch.zeros(batch_size, time_steps, 1, device=device, dtype=dtype)
+            γ = torch.zeros(batch_size, time_steps, 1, device=device, dtype=dtype)
+        
+        if BRIGHTNESS_RAW in synthesis_params:
+            α = activate_brightness(synthesis_params[BRIGHTNESS_RAW], self.α_min, self.α_max)
+        else:
+            α = torch.zeros(batch_size, time_steps, 1, device=device, dtype=dtype)
+        
+        if RESIDUALS_RAW in synthesis_params:
+            residuals = activate_residuals(synthesis_params[RESIDUALS_RAW], self.residual_scale)
+        else:
+            residuals = torch.ones(batch_size, time_steps, self.n_residuals, device=device, dtype=dtype)
 
         magnitudes_normalized, diagnostics = physics_harmonic_composer(
             β=β,
@@ -220,7 +280,11 @@ class DDSP(nn.Module):
             pitch=pitch,
             n_harmonic=self.n_harmonic,
             notch_width=self.notch_width,
-            sampling_rate=float(sampling_rate)
+            sampling_rate=float(sampling_rate),
+            use_bow_mask=self.use_bow_mask,
+            use_brightness_mask=self.use_brightness_mask,
+            use_residuals_mask=self.use_residuals_mask,
+            smooth_bow_notch=self.smooth_bow_notch
         )
 
         harmonic_signal = harmonic_synth(
@@ -240,6 +304,23 @@ class DDSP(nn.Module):
             raise RuntimeError(f"'{HARMONIC_DISTRIBUTION}' expected from Decoder.")
 
         harmonic_amplitudes = exp_sigmoid(synthesis_params[HARMONIC_DISTRIBUTION])
+        
+        # Apply brightness tilt if enabled for standard mode
+        if self.use_brightness_tilt_standard and BRIGHTNESS_RAW in synthesis_params:
+            brightness_raw = synthesis_params[BRIGHTNESS_RAW]
+            α = activate_brightness(brightness_raw, self.α_min_standard, self.α_max_standard)
+            
+            # Create harmonic numbers with proper shape [1, 1, n_harmonic]
+            device = harmonic_amplitudes.device
+            dtype = harmonic_amplitudes.dtype
+            n = torch.arange(1, self.n_harmonic + 1, device=device, dtype=dtype).view(1, 1, -1)
+            
+            # Compute brightness tilt: n^(-α)
+            brightness_tilt = n ** (-α)
+            
+            # Apply tilt multiplicatively
+            harmonic_amplitudes = harmonic_amplitudes * brightness_tilt
+        
         harmonic_amplitudes = remove_above_nyquist(
             harmonic_amplitudes, pitch, float(sampling_rate), inharmonicity_coeff
         )

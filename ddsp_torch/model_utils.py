@@ -1,7 +1,6 @@
 import torch
 from typing import Dict, Any
 
-# Dictionary keys shared between modules
 F0_SCALED = 'f0_scaled'
 LD_SCALED = 'ld_scaled'
 Z = 'z'
@@ -115,7 +114,10 @@ def get_inharmonicity_coefficient(synthesis_params: Dict[str, torch.Tensor], pit
     return B
 
 
-def print_model_summary(encoder, decoder, resonance, room, use_helmholtz, violin_config, use_inharmonicity):
+def print_model_summary(encoder, decoder, resonance, room, use_helmholtz, violin_config, 
+                       use_inharmonicity, use_brightness_standard=False, 
+                       brightness_config_standard=None, decoder_output_structure=None,
+                       resonance_position=None):
     """Prints a formatted summary of the model architecture and parameters."""
     print("\n" + "="*60)
     print("MODEL ARCHITECTURE SUMMARY")
@@ -130,10 +132,38 @@ def print_model_summary(encoder, decoder, resonance, room, use_helmholtz, violin
     decoder_params = count_parameters(decoder)
     print(f"Decoder: {decoder_params:,} parameters")
     
+    if decoder_output_structure is not None:
+        print("\nDecoder Output Structure:")
+        total_units = 0
+        for output_name, output_size in decoder_output_structure:
+            annotation = ""
+            if output_name == BRIGHTNESS_RAW:
+                if use_helmholtz:
+                    annotation = " (Violin Brightness)"
+                elif use_brightness_standard:
+                    annotation = " (Standard Brightness Tilt)"
+            elif output_name == HARMONIC_DISTRIBUTION:
+                annotation = " (Standard Mode)"
+            elif output_name == BOW_POSITION_RAW:
+                annotation = " (Violin Bow Position β)"
+            elif output_name == NOTCH_DEPTH_RAW:
+                annotation = " (Violin Notch Depth γ)"
+            elif output_name == RESIDUALS_RAW:
+                annotation = " (Violin Residuals)"
+            elif output_name == INHARMONICITY_COEFF:
+                annotation = " (Inharmonicity B)"
+            
+            print(f"  - {output_name}: {output_size} unit{'s' if output_size > 1 else ''}{annotation}")
+            total_units += output_size
+        print(f"  Total Decoder Outputs: {total_units} units")
+    
+    print()
     if resonance is not None:
         resonance_params = count_parameters(resonance)
         resonance_type = resonance.__class__.__name__
         print(f"Resonance Filter ({resonance_type}): {resonance_params:,} parameters")
+        if resonance_position is not None:
+            print(f"  - Position: {resonance_position}")
     else:
         print("Resonance Filter: Not used")
     
@@ -160,18 +190,37 @@ def print_model_summary(encoder, decoder, resonance, room, use_helmholtz, violin
     
     if use_helmholtz:
         print("\nSynthesis Mode: Violin (Physics-Guided)")
-        print(f"- Bow Position Range: [{violin_config.get('β_min', 'N/A')}, {violin_config.get('β_max', 'N/A')}]")
-        print(f"- Brightness Range: [{violin_config.get('α_min', 'N/A')}, {violin_config.get('α_max', 'N/A')}]")
-        print(f"- Notch Width: {violin_config.get('notch_width', 'N/A')}")
-        print(f"- Residuals: {violin_config.get('n_residuals', 'N/A')}")
-        print(f"- Residual Scale: {violin_config.get('residual_scale', 'N/A')}")
+        
+        use_bow = violin_config.get('use_bow_mask', True)
+        use_brightness = violin_config.get('use_brightness_mask', True)
+        use_residuals = violin_config.get('use_residuals_mask', True)
+        
+        print(f"  - Bow Mask (β, γ): {'Enabled' if use_bow else 'Disabled'}")
+        if use_bow:
+            print(f"    - Bow Position Range: [{violin_config.get('β_min', 'N/A')}, {violin_config.get('β_max', 'N/A')}]")
+            print(f"    - Notch Width: {violin_config.get('notch_width', 'N/A')}")
+        
+        print(f"  - Brightness Mask (α): {'Enabled' if use_brightness else 'Disabled'}")
+        if use_brightness:
+            print(f"    - Brightness Range: [{violin_config.get('α_min', 'N/A')}, {violin_config.get('α_max', 'N/A')}]")
+        
+        print(f"  - Residuals Mask: {'Enabled' if use_residuals else 'Disabled'}")
+        if use_residuals:
+            print(f"    - Residuals: {violin_config.get('n_residuals', 'N/A')} (scale: {violin_config.get('residual_scale', 'N/A')})")
     else:
         print("\nSynthesis Mode: Standard DDSP")
+        
+        print(f"  - Brightness Tilt: {'Enabled' if use_brightness_standard else 'Disabled'}")
+        if use_brightness_standard and brightness_config_standard is not None:
+            print(f"    - α range: [{brightness_config_standard.get('α_min', 'N/A')}, {brightness_config_standard.get('α_max', 'N/A')}]")
     
+    print(f"  - Inharmonicity: {'Enabled' if use_inharmonicity else 'Disabled'}")
     if use_inharmonicity:
-        print("- Inharmonicity: Enabled")
-    else:
-        print("- Inharmonicity: Disabled")
+        if use_helmholtz:
+            b_max = violin_config.get('inharmonicity_b_max', 'N/A')
+        else:
+            b_max = 0.0005
+        print(f"    - B_max: {b_max}")
     
     print("="*60 + "\n")
 
@@ -240,7 +289,9 @@ def smooth_notch(notch: torch.Tensor, width: float, n_harmonic: int) -> torch.Te
 
 def physics_harmonic_composer(β: torch.Tensor, γ: torch.Tensor, α: torch.Tensor,
                               residuals: torch.Tensor, B: torch.Tensor, pitch: torch.Tensor,
-                              n_harmonic: int, notch_width: float, sampling_rate: float) -> tuple:
+                              n_harmonic: int, notch_width: float, sampling_rate: float,
+                              use_bow_mask: bool = True, use_brightness_mask: bool = True,
+                              use_residuals_mask: bool = True, smooth_bow_notch: bool = True) -> tuple:
     """Composes harmonic magnitudes using violin physics model."""
     device = β.device
     dtype = β.dtype
@@ -252,17 +303,30 @@ def physics_harmonic_composer(β: torch.Tensor, γ: torch.Tensor, α: torch.Tens
     
     baseline = 1.0 / n
     
-    bow_notch = compute_bow_notch(β, n_harmonic)
-    bow_notch_smooth = smooth_notch(bow_notch, notch_width, n_harmonic)
-    bow_mask = 1.0 - γ * (1.0 - bow_notch_smooth)
+    if use_bow_mask:
+        bow_notch = compute_bow_notch(β, n_harmonic)
+        if smooth_bow_notch:
+            bow_notch_smooth = smooth_notch(bow_notch, notch_width, n_harmonic)
+        else:
+            bow_notch_smooth = bow_notch
+        bow_mask = 1.0 - γ * (1.0 - bow_notch_smooth)
+    else:
+        bow_mask = torch.ones_like(baseline)
+        bow_notch_smooth = torch.zeros_like(baseline)
     
-    brightness_tilt = n ** (-α)
+    if use_brightness_mask:
+        brightness_tilt = n ** (-α)
+    else:
+        brightness_tilt = torch.ones_like(baseline)
     
     spectrum = baseline * bow_mask * brightness_tilt
     
-    residuals_full = torch.ones(batch_size, time_steps, n_harmonic, device=device, dtype=dtype)
-    residuals_full[:, :, :n_residuals] = residuals
-    spectrum = spectrum * residuals_full
+    if use_residuals_mask:
+        residuals_full = torch.ones(batch_size, time_steps, n_harmonic, device=device, dtype=dtype)
+        residuals_full[:, :, :n_residuals] = residuals
+        spectrum = spectrum * residuals_full
+    else:
+        residuals_full = torch.ones_like(baseline)
     
     nyquist = sampling_rate / 2.0
     base_frequencies = pitch * n

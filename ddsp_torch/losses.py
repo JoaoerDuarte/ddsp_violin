@@ -97,7 +97,8 @@ class ViolinPhysicsLoss(nn.Module):
     def __init__(self, weight=0.1, weight_β=0.01, weight_α=0.01, weight_γ=0.01, 
                  weight_B=0.01, weight_residuals=0.01, residual_loss_type="l1",
                  use_activation_filter: bool = True, loudness_threshold: float = 0.2, 
-                 pitch_threshold: float = 20.0):
+                 pitch_threshold: float = 20.0, use_bow_mask: bool = True,
+                 use_brightness_mask: bool = True, use_residuals_mask: bool = True):
         super().__init__()
         self.weight = weight
         self.weight_β = weight_β
@@ -110,6 +111,10 @@ class ViolinPhysicsLoss(nn.Module):
         self.use_activation_filter = use_activation_filter
         self.loudness_threshold = loudness_threshold
         self.pitch_threshold = pitch_threshold
+        
+        self.use_bow_mask = use_bow_mask
+        self.use_brightness_mask = use_brightness_mask
+        self.use_residuals_mask = use_residuals_mask
         
         if residual_loss_type not in ["l1", "l2"]:
             raise ValueError(f"residual_loss_type must be 'l1' or 'l2', got {residual_loss_type}")
@@ -124,51 +129,70 @@ class ViolinPhysicsLoss(nn.Module):
             valid_mask = _create_frame_validity_mask(f0_hz, loudness, self.pitch_threshold, self.loudness_threshold)
             
             if not torch.any(valid_mask):
-                return torch.tensor(0.0, device=diagnostics['β'].device)
+                return torch.tensor(0.0, device=diagnostics['β'].device if 'β' in diagnostics else diagnostics['α'].device if 'α' in diagnostics else diagnostics['residuals'].device)
         else:
             valid_mask = None
         
         total_loss = 0.0
         
-        β = diagnostics['β']
-        γ = diagnostics['γ']
-        α = diagnostics['α']
-        B = diagnostics['B']
-        residuals = diagnostics['residuals']
+        β = diagnostics.get('β')
+        γ = diagnostics.get('γ')
+        α = diagnostics.get('α')
+        B = diagnostics.get('B')
+        residuals = diagnostics.get('residuals')
         
-        if β.shape[1] > 1:
-            Δβ = β[:, 1:] - β[:, :-1]
-            Δα = α[:, 1:] - α[:, :-1]
-            Δγ = γ[:, 1:] - γ[:, :-1]
-            ΔB = B[:, 1:] - B[:, :-1]
+        if self.use_bow_mask and β is not None and γ is not None:
+            if β.shape[1] > 1:
+                Δβ = β[:, 1:] - β[:, :-1]
+                Δγ = γ[:, 1:] - γ[:, :-1]
+                
+                if valid_mask is not None:
+                    valid_mask_diff = valid_mask[:, 1:] & valid_mask[:, :-1]
+                    
+                    if torch.any(valid_mask_diff):
+                        total_loss += self.weight_β * (Δβ[valid_mask_diff] ** 2).mean()
+                        total_loss += self.weight_γ * (Δγ[valid_mask_diff] ** 2).mean()
+                else:
+                    total_loss += self.weight_β * (Δβ ** 2).mean()
+                    total_loss += self.weight_γ * (Δγ ** 2).mean()
+            
+            if B is not None and B.shape[1] > 1:
+                ΔB = B[:, 1:] - B[:, :-1]
+                
+                if valid_mask is not None:
+                    valid_mask_diff = valid_mask[:, 1:] & valid_mask[:, :-1]
+                    
+                    if torch.any(valid_mask_diff):
+                        total_loss += self.weight_B * (ΔB[valid_mask_diff] ** 2).mean()
+                else:
+                    total_loss += self.weight_B * (ΔB ** 2).mean()
+        
+        if self.use_brightness_mask and α is not None:
+            if α.shape[1] > 1:
+                Δα = α[:, 1:] - α[:, :-1]
+                
+                if valid_mask is not None:
+                    valid_mask_diff = valid_mask[:, 1:] & valid_mask[:, :-1]
+                    
+                    if torch.any(valid_mask_diff):
+                        total_loss += self.weight_α * (Δα[valid_mask_diff] ** 2).mean()
+                else:
+                    total_loss += self.weight_α * (Δα ** 2).mean()
+        
+        if self.use_residuals_mask and residuals is not None:
+            deviation_from_neutral = torch.abs(residuals - 1.0)
+            
+            if self.residual_loss_type == "l2":
+                deviation_from_neutral = deviation_from_neutral ** 2
             
             if valid_mask is not None:
-                valid_mask_diff = valid_mask[:, 1:] & valid_mask[:, :-1]
+                residuals_expanded = residuals.expand(-1, -1, residuals.shape[-1])
+                valid_mask_expanded = valid_mask.unsqueeze(-1).expand_as(residuals_expanded)
                 
-                if torch.any(valid_mask_diff):
-                    total_loss += self.weight_β * (Δβ[valid_mask_diff] ** 2).mean()
-                    total_loss += self.weight_α * (Δα[valid_mask_diff] ** 2).mean()
-                    total_loss += self.weight_γ * (Δγ[valid_mask_diff] ** 2).mean()
-                    total_loss += self.weight_B * (ΔB[valid_mask_diff] ** 2).mean()
+                if torch.any(valid_mask_expanded):
+                    residual_loss = deviation_from_neutral[valid_mask_expanded].mean()
+                    total_loss += self.weight_residuals * residual_loss
             else:
-                total_loss += self.weight_β * (Δβ ** 2).mean()
-                total_loss += self.weight_α * (Δα ** 2).mean()
-                total_loss += self.weight_γ * (Δγ ** 2).mean()
-                total_loss += self.weight_B * (ΔB ** 2).mean()
-        
-        deviation_from_neutral = torch.abs(residuals - 1.0)
-        
-        if self.residual_loss_type == "l2":
-            deviation_from_neutral = deviation_from_neutral ** 2
-        
-        if valid_mask is not None:
-            residuals_expanded = residuals.expand(-1, -1, residuals.shape[-1])
-            valid_mask_expanded = valid_mask.unsqueeze(-1).expand_as(residuals_expanded)
-            
-            if torch.any(valid_mask_expanded):
-                residual_loss = deviation_from_neutral[valid_mask_expanded].mean()
-                total_loss += self.weight_residuals * residual_loss
-        else:
-            total_loss += self.weight_residuals * deviation_from_neutral.mean()
+                total_loss += self.weight_residuals * deviation_from_neutral.mean()
         
         return self.weight * total_loss
