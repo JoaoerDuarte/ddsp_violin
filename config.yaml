@@ -1,5 +1,5 @@
 train:
-  name: test_standard_brightness
+  name: test_init_arma_resonance
   root: runs/
   steps: 100
   batch_size: 8
@@ -59,6 +59,7 @@ model:
     ch: 512
     layers_per_stack: 3
     noise_bias: -5.0
+    init_harmonic_1_over_n: true  # NEW: Initialize harmonic distribution to 1/n
   
   helmholtz:
     use_helmholtz_synthesis: false  # CHANGED: Standard mode
@@ -76,15 +77,14 @@ model:
     inharmonicity_b_max: 0.0005
   
   use_resonance: true
-  resonance_type: convolutional
-  resonance_length: 2048
+  resonance_type: arma  # CHANGED: Using ARMA filter
+  resonance_ar_order: 64  # NEW: ARMA AR order
+  resonance_ma_order: 64  # NEW: ARMA MA order
+  resonance_window_size: 4096
   resonance_add_dry: false
-  resonance_mask_ir: false
-  resonance_position: before_noise
-  resonance_normalization_type: None
-  resonance_psd_prior: pink
-  resonance_n_fft: 2048
-  resonance_psd_ema_alpha: 0.99
+  resonance_max_reflection: 0.999
+  resonance_position: after_noise  # CHANGED: Apply after noise sum
+  resonance_normalization_type: rms
   
   use_room: false
   room_type: ar

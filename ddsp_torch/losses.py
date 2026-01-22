@@ -91,8 +91,12 @@ class SourceVarianceLoss(nn.Module):
         else: return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
-class ViolinPhysicsLoss(nn.Module):
-    """Regularization loss for violin mode physics parameters."""
+class HarmonicResidualLoss(nn.Module):
+    """Harmonic Residual Loss (HRL) for violin mode physics parameters.
+
+    Penalizes deviation of residual corrections from neutral (1.0) and optionally
+    penalizes temporal variation in physics parameters (β, γ, α, B).
+    """
     
     def __init__(self, weight=0.1, weight_β=0.01, weight_α=0.01, weight_γ=0.01, 
                  weight_B=0.01, weight_residuals=0.01, residual_loss_type="l1",
@@ -196,3 +200,7 @@ class ViolinPhysicsLoss(nn.Module):
                 total_loss += self.weight_residuals * deviation_from_neutral.mean()
         
         return self.weight * total_loss
+
+
+# Backward compatibility alias
+ViolinPhysicsLoss = HarmonicResidualLoss

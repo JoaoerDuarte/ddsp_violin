@@ -161,7 +161,8 @@ class DDSP(nn.Module):
             n_residuals_config=n_residuals,
             use_bow_mask=self.use_bow_mask,
             use_brightness_mask=decoder_use_brightness,
-            use_residuals_mask=self.use_residuals_mask
+            use_residuals_mask=self.use_residuals_mask,
+            init_harmonic_1_over_n=bool(self.decoder_config.get("init_harmonic_1_over_n", False))
         )
 
     def _initialize_filters(self):

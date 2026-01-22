@@ -14,7 +14,7 @@ from torch.optim.lr_scheduler import _LRScheduler
 
 from preprocess import Dataset
 from ddsp_torch.model import DDSP
-from ddsp_torch.losses import MultiScaleSTFTLoss, SourceVarianceLoss, ViolinPhysicsLoss
+from ddsp_torch.losses import MultiScaleSTFTLoss, SourceVarianceLoss, HarmonicResidualLoss
 
 
 class TFExponentialDecay(_LRScheduler):
@@ -149,7 +149,7 @@ def setup_loss_functions(config, device):
     violin_loss_config = loss_config.get("violin_physics", {})
     
     use_violin_synthesis = bool(helmholtz_config.get("use_helmholtz_synthesis", False))
-    use_vpl_config_flag = bool(loss_config.get("use_helmholtz_deviation_loss", True))
+    use_hrl_config_flag = bool(loss_config.get("use_helmholtz_deviation_loss", True))
     
     try:
         mssl = MultiScaleSTFTLoss(
@@ -170,17 +170,17 @@ def setup_loss_functions(config, device):
         else:
             print("\nSource Variance Loss: Disabled")
 
-        vpl = None
-        vpl_weight = float(violin_loss_config.get("weight", 0.0))
-        vpl_active = use_violin_synthesis and use_vpl_config_flag and vpl_weight > 0
+        hrl = None
+        hrl_weight = float(violin_loss_config.get("weight", 0.0))
+        hrl_active = use_violin_synthesis and use_hrl_config_flag and hrl_weight > 0
 
-        if vpl_active:
+        if hrl_active:
             use_bow_mask = bool(helmholtz_config.get("use_bow_mask", True))
             use_brightness_mask = bool(helmholtz_config.get("use_brightness_mask", True))
             use_residuals_mask = bool(helmholtz_config.get("use_residuals_mask", True))
-            
-            vpl = ViolinPhysicsLoss(
-                weight=vpl_weight,
+
+            hrl = HarmonicResidualLoss(
+                weight=hrl_weight,
                 weight_β=float(violin_loss_config.get("smoothness_β", 0.01)),
                 weight_α=float(violin_loss_config.get("smoothness_α", 0.01)),
                 weight_γ=float(violin_loss_config.get("smoothness_γ", 0.01)),
@@ -194,18 +194,18 @@ def setup_loss_functions(config, device):
                 use_brightness_mask=use_brightness_mask,
                 use_residuals_mask=use_residuals_mask
             ).to(device)
-            print(f"Violin Physics Loss: Enabled (Weight: {vpl_weight})")
-        elif use_violin_synthesis and (not use_vpl_config_flag or vpl_weight <= 0):
+            print(f"Harmonic Residual Loss (HRL): Enabled (Weight: {hrl_weight})")
+        elif use_violin_synthesis and (not use_hrl_config_flag or hrl_weight <= 0):
             status_reasons = []
-            if not use_vpl_config_flag:
+            if not use_hrl_config_flag:
                 status_reasons.append("Config Toggle is False")
-            if vpl_weight <= 0:
+            if hrl_weight <= 0:
                 status_reasons.append("Weight is <= 0")
-            print(f"Violin Physics Loss: Configured but INACTIVE ({', '.join(status_reasons)})")
+            print(f"Harmonic Residual Loss (HRL): Configured but INACTIVE ({', '.join(status_reasons)})")
         else:
-            print("Violin Physics Loss: Disabled")
+            print("Harmonic Residual Loss (HRL): Disabled")
 
-        return mssl, svl, vpl, svl_active, vpl_active
+        return mssl, svl, hrl, svl_active, hrl_active
 
     except KeyError as e:
         print(f"Error: Missing required key in loss config: {e}")
@@ -275,7 +275,7 @@ def create_dataset_and_dataloader(preprocess_dir, train_params):
         sys.exit(1)
 
 
-def setup_logging(run_dir, svl_active, vpl_active):
+def setup_logging(run_dir, svl_active, hrl_active):
     """Initialize logging systems."""
     writer = None
     loss_log_path = None
@@ -286,9 +286,9 @@ def setup_logging(run_dir, svl_active, vpl_active):
         
         loss_header_parts = ["step", "total_loss", "spectral_loss", "forward_ms", "backward_ms", "total_ms"]
         if svl_active:
-            loss_header_parts.append("variance_loss")
-        if vpl_active:
-            loss_header_parts.append("violin_physics_loss")
+            loss_header_parts.append("svl_loss")
+        if hrl_active:
+            loss_header_parts.append("hrl_loss")
         
         loss_header = ",".join(loss_header_parts) + "\n"
         with open(loss_log_path, "w") as f:
@@ -322,49 +322,49 @@ def setup_optimizer_and_scheduler(model, train_params):
     return optimizer, scheduler, trainable_params
 
 
-def calculate_loss(mssl, svl, vpl, model_outputs, target_signal, pitch, loudness,
-                  svl_active, vpl_active, svl_threshold, recent_mssl_avg):
+def calculate_loss(mssl, svl, hrl, model_outputs, target_signal, pitch, loudness,
+                  svl_active, hrl_active, svl_threshold, recent_mssl_avg):
     """Calculate total loss from all components."""
     predicted_signal = model_outputs['signal'].squeeze(-1)
     target_for_loss = target_signal.squeeze(-1) if target_signal.dim() > 2 else target_signal
-    
+
     spectral_loss = mssl(predicted_signal, target_for_loss)
     total_loss = spectral_loss
-    
+
     variance_loss_value = None
-    violin_physics_loss_value = None
+    hrl_loss_value = None
     svl_applied = False
-    vpl_applied = False
-    
+    hrl_applied = False
+
     if svl_active and model_outputs.get('harmonic_amplitudes') is not None and recent_mssl_avg < svl_threshold:
         variance_loss_component = svl(model_outputs['harmonic_amplitudes'], pitch, loudness)
         variance_loss_value = variance_loss_component.item() if isinstance(variance_loss_component, torch.Tensor) else float(variance_loss_component)
         total_loss = total_loss + variance_loss_component
         svl_applied = True
-    
-    if vpl_active and model_outputs.get('violin_diagnostics') is not None:
-        violin_physics_component = vpl(
+
+    if hrl_active and model_outputs.get('violin_diagnostics') is not None:
+        hrl_component = hrl(
             model_outputs['violin_diagnostics'],
             f0_hz=pitch,
             loudness=loudness
         )
-        violin_physics_loss_value = violin_physics_component.item() if isinstance(violin_physics_component, torch.Tensor) else float(violin_physics_component)
-        total_loss = total_loss + violin_physics_component
-        vpl_applied = True
-    
-    return total_loss, spectral_loss, variance_loss_value, violin_physics_loss_value, svl_applied, vpl_applied
+        hrl_loss_value = hrl_component.item() if isinstance(hrl_component, torch.Tensor) else float(hrl_component)
+        total_loss = total_loss + hrl_component
+        hrl_applied = True
+
+    return total_loss, spectral_loss, variance_loss_value, hrl_loss_value, svl_applied, hrl_applied
 
 
 def log_training_metrics(writer, loss_log_path, global_step, total_loss_value, spectral_loss_value,
-                        forward_time, backward_time, total_time, variance_loss_value, 
-                        violin_physics_loss_value, svl_active, vpl_active):
+                        forward_time, backward_time, total_time, variance_loss_value,
+                        hrl_loss_value, svl_active, hrl_active):
     """Log metrics to TensorBoard and CSV file."""
     try:
         if writer:
             log_training_step(
                 writer, global_step, total_loss_value, spectral_loss_value,
                 forward_time, backward_time, total_time,
-                variance_loss_value, violin_physics_loss_value
+                variance_loss_value, hrl_loss_value
             )
 
         if loss_log_path:
@@ -374,8 +374,8 @@ def log_training_metrics(writer, loss_log_path, global_step, total_loss_value, s
             ]
             if svl_active:
                 log_items.append(f"{variance_loss_value if variance_loss_value is not None else 0.0:.6f}")
-            if vpl_active:
-                log_items.append(f"{violin_physics_loss_value if violin_physics_loss_value is not None else 0.0:.6f}")
+            if hrl_active:
+                log_items.append(f"{hrl_loss_value if hrl_loss_value is not None else 0.0:.6f}")
             
             log_line = ",".join(log_items) + "\n"
             with open(loss_log_path, "a") as log_f:
@@ -433,9 +433,9 @@ def print_training_info(config: dict, device: torch.device, steps: int, batch_si
     use_violin = bool(violin_model_config.get('use_helmholtz_synthesis', False))
     use_svl_config = bool(loss_config.get('use_source_variance', False))
     svl_active = use_svl_config and not use_violin
-    vpl_weight = float(violin_loss_config.get("weight", 0.0))
-    use_vpl_config_toggle = bool(loss_config.get("use_helmholtz_deviation_loss", True))
-    vpl_active = use_violin and use_vpl_config_toggle and vpl_weight > 0
+    hrl_weight = float(violin_loss_config.get("weight", 0.0))
+    use_hrl_config_toggle = bool(loss_config.get("use_helmholtz_deviation_loss", True))
+    hrl_active = use_violin and use_hrl_config_toggle and hrl_weight > 0
 
     print(f"- Multi-Scale STFT Loss: Enabled")
     print(f"  - Scales: {loss_config.get('mssl', {}).get('scales', 'N/A')}")
@@ -446,9 +446,9 @@ def print_training_info(config: dict, device: torch.device, steps: int, batch_si
         print(f"  - Weight: {loss_config.get('source_variance', {}).get('weight', 'N/A')}")
         print(f"  - Activation Threshold (MSSL): {train_config.get('svl_activation_threshold', 'N/A')}")
 
-    print(f"- Violin Physics Loss: {'Enabled' if vpl_active else 'Disabled'}")
-    if vpl_active:
-        print(f"  - Weight: {vpl_weight}")
+    print(f"- Harmonic Residual Loss (HRL): {'Enabled' if hrl_active else 'Disabled'}")
+    if hrl_active:
+        print(f"  - Weight: {hrl_weight}")
         print(f"  - Residual Loss Type: {violin_loss_config.get('residual_loss_type', 'N/A')}")
     print("-----------------------------")
 
@@ -587,16 +587,16 @@ def setup_data_pipeline(config: dict):
 def log_training_step(writer: SummaryWriter, step: int, total_loss: float, spectral_loss: float,
                      forward_time: float, backward_time: float, total_time: float,
                      variance_loss_value: float | None = None,
-                     violin_physics_loss_value: float | None = None):
+                     hrl_loss_value: float | None = None):
     """Logs training metrics for a single step to TensorBoard."""
     writer.add_scalar("Loss/Total", total_loss, step)
     writer.add_scalar("Loss/Spectral", spectral_loss, step)
 
     if variance_loss_value is not None:
-        writer.add_scalar("Loss/Variance", variance_loss_value, step)
+        writer.add_scalar("Loss/SVL", variance_loss_value, step)
 
-    if violin_physics_loss_value is not None:
-        writer.add_scalar("Loss/ViolinPhysics", violin_physics_loss_value, step)
+    if hrl_loss_value is not None:
+        writer.add_scalar("Loss/HRL", hrl_loss_value, step)
 
     writer.add_scalar("Time/Forward_ms", forward_time * 1000, step)
     writer.add_scalar("Time/Backward_ms", backward_time * 1000, step)
@@ -606,7 +606,7 @@ def log_training_step(writer: SummaryWriter, step: int, total_loss: float, spect
 def format_progress_dict(epoch: int, spectral_loss_val: float, total_loss_val: float,
                          avg_mssl_loss: float, learning_rate: float,
                          variance_loss_value: float | None = None,
-                         violin_physics_loss_value: float | None = None) -> dict:
+                         hrl_loss_value: float | None = None) -> dict:
     """Creates a dictionary for displaying progress in the tqdm progress bar."""
     progress_dict = {
         'Epoch': epoch + 1,
@@ -615,11 +615,11 @@ def format_progress_dict(epoch: int, spectral_loss_val: float, total_loss_val: f
         'AvgMSSL': f'{avg_mssl_loss:.4f}',
         'LR': f'{learning_rate:.2e}',
     }
-    
+
     if variance_loss_value is not None:
         progress_dict['SVL'] = f'{variance_loss_value:.4f}'
 
-    if violin_physics_loss_value is not None:
-        progress_dict['VPL'] = f'{violin_physics_loss_value:.4f}'
+    if hrl_loss_value is not None:
+        progress_dict['HRL'] = f'{hrl_loss_value:.4f}'
 
     return progress_dict

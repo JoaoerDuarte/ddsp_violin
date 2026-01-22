@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 from .nn import MLP, GRU
@@ -16,7 +17,7 @@ class Decoder(nn.Module):
                  use_inharmonicity_config: bool = True, n_harmonic_config: int = 60,
                  n_bands_config: int = 65, n_residuals_config: int = 10,
                  use_bow_mask: bool = True, use_brightness_mask: bool = True,
-                 use_residuals_mask: bool = True):
+                 use_residuals_mask: bool = True, init_harmonic_1_over_n: bool = False):
         super().__init__()
 
         self.input_names = inputs
@@ -46,6 +47,9 @@ class Decoder(nn.Module):
         total_output_units = sum(size for _, size in self.output_structure)
         self.dense_out = nn.Linear(ch, total_output_units)
 
+        if init_harmonic_1_over_n and not use_helmholtz_config:
+            self._init_harmonic_1_over_n_bias(n_harmonic_config)
+
     def _build_output_structure(self, use_helmholtz, use_inharmonicity, n_harmonic, n_bands, 
                                 n_residuals, use_bow_mask, use_brightness_mask, use_residuals_mask):
         """Build output structure based on configuration flags."""
@@ -69,6 +73,33 @@ class Decoder(nn.Module):
 
         structure.append((NOISE_MAGNITUDES, n_bands))
         return structure
+
+    def _init_harmonic_1_over_n_bias(self, n_harmonic: int):
+        """Initialize bias so harmonic_distribution outputs ~1/n after exp_sigmoid."""
+        with torch.no_grad():
+            # Find starting index of HARMONIC_DISTRIBUTION in output
+            start_idx = 0
+            for name, size in self.output_structure:
+                if name == HARMONIC_DISTRIBUTION:
+                    break
+                start_idx += size
+
+            # exp_sigmoid parameters (defaults from core.py)
+            log_exp = math.log(10.0)
+            max_value = 2.0
+            threshold = 1e-7
+
+            bias_values = torch.zeros(n_harmonic)
+            for i, n in enumerate(range(1, n_harmonic + 1)):
+                target = 1.0 / n
+                # Inverse of exp_sigmoid: sigmoid_val = ((target - threshold) / max_value)^(1/log_exp)
+                sigmoid_val = ((target - threshold) / max_value) ** (1.0 / log_exp)
+                # Clamp to valid range for logit
+                sigmoid_val = max(min(sigmoid_val, 1.0 - 1e-6), 1e-6)
+                # Logit (inverse sigmoid)
+                bias_values[i] = math.log(sigmoid_val / (1.0 - sigmoid_val))
+
+            self.dense_out.bias.data[start_idx:start_idx + n_harmonic] = bias_values
 
     def forward(self, **inputs) -> dict[str, torch.Tensor]:
         for key in self.input_names:
