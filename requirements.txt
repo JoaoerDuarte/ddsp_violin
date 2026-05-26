@@ -1,0 +1,10 @@
+torch>=2.0
+torchaudio>=2.0
+numpy
+librosa
+soundfile
+crepe
+pyyaml
+tqdm
+tensorboard
+effortless-config

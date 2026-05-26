@@ -5,17 +5,15 @@ from .nn import MLP, GRU
 from .model_utils import (
     F0_SCALED, LD_SCALED, Z, AMPS, HARMONIC_DISTRIBUTION, NOISE_MAGNITUDES,
     BOW_POSITION_RAW, NOTCH_DEPTH_RAW, BRIGHTNESS_RAW, RESIDUALS_RAW,
-    INHARMONICITY_COEFF
 )
 
 
 class Decoder(nn.Module):
-    """Decodes conditioning inputs into synthesis parameters with dynamic output structure."""
-    
+    """Decode (f0, loudness, z) → synthesis parameters with a config-driven output structure."""
+
     def __init__(self, inputs: list[str], z_dims: int | None = None, rnn_channels: int = 512,
                  ch: int = 512, layers_per_stack: int = 3, use_helmholtz_config: bool = False,
-                 use_inharmonicity_config: bool = True, n_harmonic_config: int = 60,
-                 n_bands_config: int = 65, n_residuals_config: int = 10,
+                 n_harmonic_config: int = 60, n_bands_config: int = 65, n_residuals_config: int = 10,
                  use_bow_mask: bool = True, use_brightness_mask: bool = True,
                  use_residuals_mask: bool = True, init_harmonic_1_over_n: bool = False):
         super().__init__()
@@ -29,9 +27,8 @@ class Decoder(nn.Module):
             raise ValueError("z_dims must be provided if Z is in decoder inputs.")
 
         self.output_structure = self._build_output_structure(
-            use_helmholtz_config, use_inharmonicity_config, n_harmonic_config,
-            n_bands_config, n_residuals_config, use_bow_mask, use_brightness_mask,
-            use_residuals_mask
+            use_helmholtz_config, n_harmonic_config, n_bands_config, n_residuals_config,
+            use_bow_mask, use_brightness_mask, use_residuals_mask,
         )
 
         self.input_stacks = nn.ModuleDict({
@@ -50,9 +47,9 @@ class Decoder(nn.Module):
         if init_harmonic_1_over_n and not use_helmholtz_config:
             self._init_harmonic_1_over_n_bias(n_harmonic_config)
 
-    def _build_output_structure(self, use_helmholtz, use_inharmonicity, n_harmonic, n_bands, 
-                                n_residuals, use_bow_mask, use_brightness_mask, use_residuals_mask):
-        """Build output structure based on configuration flags."""
+    def _build_output_structure(self, use_helmholtz, n_harmonic, n_bands, n_residuals,
+                                use_bow_mask, use_brightness_mask, use_residuals_mask):
+        """List of (name, size) tuples describing the decoder's flat output vector."""
         structure = [(AMPS, 1)]
 
         if use_helmholtz:
@@ -67,9 +64,6 @@ class Decoder(nn.Module):
             structure.append((HARMONIC_DISTRIBUTION, n_harmonic))
             if use_brightness_mask:
                 structure.append((BRIGHTNESS_RAW, 1))
-
-        if use_inharmonicity:
-            structure.append((INHARMONICITY_COEFF, 1))
 
         structure.append((NOISE_MAGNITUDES, n_bands))
         return structure

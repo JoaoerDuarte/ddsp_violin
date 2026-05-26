@@ -1,8 +1,8 @@
-# DDSP-Violin (flagship): all masks enabled, FIR resonance, no HRL.
-# Matches the "DDSP-Violin" row in Table I of the paper.
+# DDSP baseline: standard DDSP with FIR resonance repurposed as the body filter,
+# no source constraints. Matches the "Baseline" row in Table I of the paper.
 
 train:
-  name: ddsp_violin
+  name: ddsp_baseline
   root: runs/
   steps: 10000
   batch_size: 8
@@ -19,7 +19,7 @@ train:
   preprocessed_data_dir: preprocessed
 
 preprocess:
-  out_dir: preprocessed/ddsp_violin
+  out_dir: preprocessed/ddsp_baseline
   sampling_rate: 16000
   block_size: 64
   signal_length: 64000
@@ -29,12 +29,13 @@ preprocess:
 data:
   data_location: dataset/audio
   extension: wav
-  dataset_name: ddsp_violin
+  dataset_name: ddsp_baseline
 
 model:
   sampling_rate: 16000
   block_size: 64
   signal_length: 64000
+  use_brightness_tilt_standard: false
 
   encoder:
     use_encoder: true
@@ -58,23 +59,14 @@ model:
     init_harmonic_1_over_n: false
 
   helmholtz:
-    use_helmholtz_synthesis: true
-    use_bow_mask: true
-    use_brightness_mask: true
-    use_residuals_mask: true
-    "β_min": 0.05
-    "β_max": 0.5
-    "α_min": -1.0
-    "α_max": 1.0
-    n_residuals: 10
-    residual_scale: 1.0
+    use_helmholtz_synthesis: false
 
   use_resonance: true
   resonance_type: convolutional
   resonance_window_size: 2048
   resonance_add_dry: false
   resonance_max_reflection: 0.999
-  resonance_position: before_noise
+  resonance_position: after_noise
   resonance_normalization_type: rms
 
   use_room: false
@@ -84,11 +76,4 @@ loss:
     scales: [2048, 1024, 512, 256, 128, 64]
     overlap: 0.75
 
-  use_hrl: false  # set to true with violin_physics.weight > 0 to enable HRL
-  violin_physics:
-    weight: 0.0
-    residual_magnitude: 1.0
-    residual_loss_type: l2
-    use_activation_filter: true
-    loudness_threshold: 0.2
-    pitch_threshold: 20.0
+  use_hrl: false

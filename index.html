@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DDSP-Violin — Audio Examples</title>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    max-width: 900px;
+    margin: 2em auto;
+    padding: 0 1em;
+    color: #24292f;
+    line-height: 1.5;
+  }
+  h1 { margin-bottom: 0.2em; }
+  h1 + p { color: #57606a; margin-top: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 1.5em 0; }
+  th, td { padding: 10px; border-bottom: 1px solid #d0d7de; text-align: left; vertical-align: middle; }
+  th { background: #f6f8fa; font-weight: 600; font-size: 0.95em; }
+  audio { width: 200px; }
+  a { color: #0969da; }
+</style>
+</head>
+<body>
+
+<h1>DDSP-Violin — Audio Examples</h1>
+<p>Companion to <em>"DDSP-Violin: Physically-Informed Constraints for Disentangled Source-Filter Decomposition"</em> (EUSIPCO 2026).</p>
+
+<p>Each row provides three audio versions of the same sample:</p>
+<ul>
+  <li><strong>Target</strong> — physical-model bridge force convolved with the measured body IR.</li>
+  <li><strong>Source</strong> — DDSP-Violin's bridge-force estimate (before the learned body filter).</li>
+  <li><strong>Reconstruction</strong> — DDSP-Violin's full output (source + learned body filter).</li>
+</ul>
+
+<table>
+<thead>
+  <tr>
+    <th>String</th>
+    <th>Target</th>
+    <th>Source</th>
+    <th>Reconstruction</th>
+  </tr>
+</thead>
+<tbody>
+  <tr>
+    <td>G</td>
+    <td><audio controls preload="none" src="audio_examples/G/gt_convolved.wav"></audio></td>
+    <td><audio controls preload="none" src="audio_examples/G/model_source.wav"></audio></td>
+    <td><audio controls preload="none" src="audio_examples/G/model_output.wav"></audio></td>
+  </tr>
+  <tr>
+    <td>D</td>
+    <td><audio controls preload="none" src="audio_examples/D/gt_convolved.wav"></audio></td>
+    <td><audio controls preload="none" src="audio_examples/D/model_source.wav"></audio></td>
+    <td><audio controls preload="none" src="audio_examples/D/model_output.wav"></audio></td>
+  </tr>
+  <tr>
+    <td>A</td>
+    <td><audio controls preload="none" src="audio_examples/A/gt_convolved.wav"></audio></td>
+    <td><audio controls preload="none" src="audio_examples/A/model_source.wav"></audio></td>
+    <td><audio controls preload="none" src="audio_examples/A/model_output.wav"></audio></td>
+  </tr>
+  <tr>
+    <td>E</td>
+    <td><audio controls preload="none" src="audio_examples/E/gt_convolved.wav"></audio></td>
+    <td><audio controls preload="none" src="audio_examples/E/model_source.wav"></audio></td>
+    <td><audio controls preload="none" src="audio_examples/E/model_output.wav"></audio></td>
+  </tr>
+</tbody>
+</table>
+
+<p>Source code: <a href="https://github.com/JoaoerDuarte/ddsp_violin">github.com/JoaoerDuarte/ddsp_violin</a>.</p>
+
+</body>
+</html>

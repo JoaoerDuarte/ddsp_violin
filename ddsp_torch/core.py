@@ -181,35 +181,13 @@ def upsample(signal: torch.Tensor, factor: int, method: str = 'linear') -> torch
         raise ValueError(f"Unknown upsampling method: {method}")
 
 
-def remove_above_nyquist(amplitudes: torch.Tensor, pitch: torch.Tensor, sampling_rate: float | int,
-                        inharmonicity_coeff: torch.Tensor | None = None) -> torch.Tensor:
-    """Zeros amplitudes of harmonics above the Nyquist frequency.
-    
-    Args:
-        amplitudes: Harmonic amplitudes [B, T, n_harmonics]
-        pitch: Fundamental frequency [B, T, 1]
-        sampling_rate: Audio sampling rate in Hz
-        inharmonicity_coeff: Inharmonicity coefficient B [B, T, 1]. If provided,
-                           applies inharmonicity before Nyquist check to avoid aliasing.
-    
-    Returns:
-        Masked amplitudes with harmonics above Nyquist set to zero
-    """
+def remove_above_nyquist(amplitudes: torch.Tensor, pitch: torch.Tensor,
+                         sampling_rate: float | int) -> torch.Tensor:
+    """Zeros amplitudes of harmonics whose frequency exceeds Nyquist."""
     n_harmonics = amplitudes.shape[-1]
     harmonic_numbers = torch.arange(1, n_harmonics + 1, device=amplitudes.device, dtype=amplitudes.dtype)
-    
-    # Calculate base harmonic frequencies
-    base_harmonic_freqs = pitch * harmonic_numbers
-    
-    # Apply inharmonicity if provided
-    if inharmonicity_coeff is not None and torch.any(inharmonicity_coeff.abs() > 1e-7):
-        inharmonicity_factor = torch.sqrt(1.0 + inharmonicity_coeff * (harmonic_numbers ** 2))
-        harmonic_freqs = base_harmonic_freqs * inharmonicity_factor
-    else:
-        harmonic_freqs = base_harmonic_freqs
-    
-    nyquist = sampling_rate / 2.0
-    mask = (harmonic_freqs < nyquist).to(amplitudes.dtype)
+    harmonic_freqs = pitch * harmonic_numbers
+    mask = (harmonic_freqs < sampling_rate / 2.0).to(amplitudes.dtype)
     return amplitudes * mask
 
 

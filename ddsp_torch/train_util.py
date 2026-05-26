@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import soundfile as sf
 import yaml
 import numpy as np
@@ -14,13 +13,13 @@ from torch.optim.lr_scheduler import _LRScheduler
 
 from preprocess import Dataset
 from ddsp_torch.model import DDSP
-from ddsp_torch.losses import MultiScaleSTFTLoss, SourceVarianceLoss, HarmonicResidualLoss
+from ddsp_torch.losses import MultiScaleSTFTLoss, HarmonicResidualLoss
 
 
 class TFExponentialDecay(_LRScheduler):
     """Learning rate scheduler mimicking TensorFlow's ExponentialDecay."""
-    
-    def __init__(self, optimizer: torch.optim.Optimizer, initial_lr: float, decay_steps: int, 
+
+    def __init__(self, optimizer: torch.optim.Optimizer, initial_lr: float, decay_steps: int,
                  decay_rate: float, staircase: bool = False):
         self.initial_lr = initial_lr
         self.decay_steps = decay_steps
@@ -30,45 +29,27 @@ class TFExponentialDecay(_LRScheduler):
 
     def get_lr(self) -> list[float]:
         step = self._step_count
-
-        if self.staircase:
-            exponent = step // self.decay_steps
-        else:
-            exponent = step / self.decay_steps
-
-        decay_factor = self.decay_rate ** exponent
-        current_lr = self.initial_lr * decay_factor
-
+        exponent = step // self.decay_steps if self.staircase else step / self.decay_steps
+        current_lr = self.initial_lr * (self.decay_rate ** exponent)
         return [current_lr for _ in self.base_lrs]
 
 
-def get_tensorflow_scheduler(optimizer: torch.optim.Optimizer, initial_lr: float = 0.001, 
-                           decay_steps: int = 10000, decay_rate: float = 0.98, 
-                           staircase: bool = False) -> TFExponentialDecay:
-    return TFExponentialDecay(
-        optimizer=optimizer,
-        initial_lr=initial_lr,
-        decay_steps=decay_steps,
-        decay_rate=decay_rate,
-        staircase=staircase
-    )
+def get_tensorflow_scheduler(optimizer, initial_lr=0.001, decay_steps=10000,
+                             decay_rate=0.98, staircase=False):
+    return TFExponentialDecay(optimizer, initial_lr, decay_steps, decay_rate, staircase)
 
 
 def load_configuration():
-    """Parse arguments and load configuration file."""
+    """Parse `--CONFIG <name>` and load `configs/<name>.yaml` or default `config.yaml`."""
     from effortless_config import Config
-    
+
     class args(Config):
         CONFIG = None
 
     args.parse_args()
 
-    if args.CONFIG is None:
-        config_path = "config.yaml"
-        print(f"Using default configuration: {config_path}")
-    else:
-        config_path = f"configs/{args.CONFIG}.yaml"
-        print(f"Using specified configuration: {config_path}")
+    config_path = "config.yaml" if args.CONFIG is None else f"configs/{args.CONFIG}.yaml"
+    print(f"Loading configuration: {config_path}")
 
     if not path.exists(config_path):
         print(f"Error: Config file not found at {config_path}")
@@ -77,7 +58,6 @@ def load_configuration():
     try:
         with open(config_path, "r") as config_file:
             config = yaml.safe_load(config_file)
-        print("Configuration loaded successfully.")
         return config, args.CONFIG
     except Exception as e:
         print(f"Error loading config file {config_path}: {e}")
@@ -85,7 +65,7 @@ def load_configuration():
 
 
 def extract_training_parameters(config):
-    """Extract and validate training parameters from config."""
+    """Extract training hyperparameters with sensible defaults."""
     try:
         train_config = config["train"]
         return {
@@ -99,124 +79,88 @@ def extract_training_parameters(config):
             'decay_steps': int(train_config.get("lr_decay_steps", 10000)),
             'decay_rate': float(train_config.get("lr_decay_rate", 0.98)),
             'staircase': bool(train_config.get("lr_staircase", False)),
-            'svl_activation_threshold': float(train_config.get("svl_activation_threshold", 10.0)),
             'num_workers': int(train_config.get("dataloader_num_workers", 4)),
-            'pin_memory': bool(train_config.get("dataloader_pin_memory", True))
+            'pin_memory': bool(train_config.get("dataloader_pin_memory", True)),
         }
     except KeyError as e:
         print(f"Error: Missing required key in 'train' config section: {e}")
         sys.exit(1)
-    except ValueError as e:
-        print(f"Error: Invalid value type in 'train' config section: {e}")
-        sys.exit(1)
 
 
 def setup_run_directory(config):
-    """Create run directory and save config."""
+    """Create the run directory and write a copy of the config there."""
     train_config = config["train"]
     run_dir = path.join(train_config.get("root", "runs"), train_config["name"])
     makedirs(run_dir, exist_ok=True)
     print(f"Run directory: {run_dir}")
-    
+
     try:
         with open(path.join(run_dir, "config.yaml"), "w") as f:
             yaml.safe_dump(config, f)
     except Exception as e:
         print(f"Warning: Could not save config to run directory: {e}")
-    
+
     return run_dir
 
 
 def initialize_model(config, device):
-    """Initialize DDSP model and move to device."""
+    """Build the DDSP model from `model` config and move to device."""
     try:
-        model = DDSP(**config.get("model", {})).to(device)
-        return model
-    except KeyError as e:
-        print(f"Error: Missing required key in 'model' config section: {e}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"Error initializing DDSP model:")
+        return DDSP(**config.get("model", {})).to(device)
+    except Exception:
+        print("Error initializing DDSP model:")
         traceback.print_exc()
         sys.exit(1)
 
 
 def setup_loss_functions(config, device):
-    """Initialize loss functions based on configuration."""
+    """Build MSSL (always) and HRL (if enabled in violin mode)."""
     loss_config = config.get("loss", {})
-    model_config = config.get("model", {})
-    helmholtz_config = model_config.get("helmholtz", {})
+    helmholtz_config = config.get("model", {}).get("helmholtz", {})
     violin_loss_config = loss_config.get("violin_physics", {})
-    
+
     use_violin_synthesis = bool(helmholtz_config.get("use_helmholtz_synthesis", False))
-    use_hrl_config_flag = bool(loss_config.get("use_helmholtz_deviation_loss", True))
-    
+    use_hrl_flag = bool(loss_config.get("use_hrl", False))
+
     try:
         mssl = MultiScaleSTFTLoss(
             scales=loss_config["mssl"]["scales"],
-            overlap=loss_config["mssl"]["overlap"]
+            overlap=loss_config["mssl"]["overlap"],
         ).to(device)
-
-        svl = None
-        use_svl_config_flag = bool(loss_config.get("use_source_variance", False))
-        svl_active = use_svl_config_flag and not use_violin_synthesis
-
-        if svl_active:
-            svl_params = loss_config.get("source_variance", {})
-            svl = SourceVarianceLoss(**svl_params).to(device)
-            print("\nSource Variance Loss: Enabled (Standard Mode)")
-        elif use_svl_config_flag and use_violin_synthesis:
-            print("\nSource Variance Loss: Configured but INACTIVE (Violin Mode)")
-        else:
-            print("\nSource Variance Loss: Disabled")
 
         hrl = None
         hrl_weight = float(violin_loss_config.get("weight", 0.0))
-        hrl_active = use_violin_synthesis and use_hrl_config_flag and hrl_weight > 0
+        hrl_active = use_violin_synthesis and use_hrl_flag and hrl_weight > 0
 
         if hrl_active:
-            use_bow_mask = bool(helmholtz_config.get("use_bow_mask", True))
-            use_brightness_mask = bool(helmholtz_config.get("use_brightness_mask", True))
-            use_residuals_mask = bool(helmholtz_config.get("use_residuals_mask", True))
-
             hrl = HarmonicResidualLoss(
                 weight=hrl_weight,
-                weight_β=float(violin_loss_config.get("smoothness_β", 0.01)),
-                weight_α=float(violin_loss_config.get("smoothness_α", 0.01)),
-                weight_γ=float(violin_loss_config.get("smoothness_γ", 0.01)),
-                weight_B=float(violin_loss_config.get("smoothness_B", 0.01)),
-                weight_residuals=float(violin_loss_config.get("residual_magnitude", 0.01)),
-                residual_loss_type=str(violin_loss_config.get("residual_loss_type", "l1")),
+                weight_β=float(violin_loss_config.get("smoothness_β", 0.0)),
+                weight_α=float(violin_loss_config.get("smoothness_α", 0.0)),
+                weight_γ=float(violin_loss_config.get("smoothness_γ", 0.0)),
+                weight_B=float(violin_loss_config.get("smoothness_B", 0.0)),
+                weight_residuals=float(violin_loss_config.get("residual_magnitude", 1.0)),
+                residual_loss_type=str(violin_loss_config.get("residual_loss_type", "l2")),
                 use_activation_filter=bool(violin_loss_config.get("use_activation_filter", True)),
                 loudness_threshold=float(violin_loss_config.get("loudness_threshold", 0.2)),
                 pitch_threshold=float(violin_loss_config.get("pitch_threshold", 20.0)),
-                use_bow_mask=use_bow_mask,
-                use_brightness_mask=use_brightness_mask,
-                use_residuals_mask=use_residuals_mask
+                use_bow_mask=bool(helmholtz_config.get("use_bow_mask", True)),
+                use_brightness_mask=bool(helmholtz_config.get("use_brightness_mask", True)),
+                use_residuals_mask=bool(helmholtz_config.get("use_residuals_mask", True)),
             ).to(device)
             print(f"Harmonic Residual Loss (HRL): Enabled (Weight: {hrl_weight})")
-        elif use_violin_synthesis and (not use_hrl_config_flag or hrl_weight <= 0):
-            status_reasons = []
-            if not use_hrl_config_flag:
-                status_reasons.append("Config Toggle is False")
-            if hrl_weight <= 0:
-                status_reasons.append("Weight is <= 0")
-            print(f"Harmonic Residual Loss (HRL): Configured but INACTIVE ({', '.join(status_reasons)})")
         else:
             print("Harmonic Residual Loss (HRL): Disabled")
 
-        return mssl, svl, hrl, svl_active, hrl_active
+        return mssl, hrl, hrl_active
 
     except KeyError as e:
         print(f"Error: Missing required key in loss config: {e}")
         sys.exit(1)
-    except Exception as e:
-        print(f"Error setting up loss functions: {e}")
-        sys.exit(1)
 
 
 def run_preprocessing_if_needed(config, config_name):
-    """Run preprocessing subprocess if needed."""
+    """Run `preprocess.py` as a subprocess if cached files don't already exist."""
     try:
         preprocess_dir, preprocess_exists = setup_data_pipeline(config)
     except Exception as e:
@@ -224,19 +168,16 @@ def run_preprocessing_if_needed(config, config_name):
         sys.exit(1)
 
     if not preprocess_exists:
-        print("\nRunning subprocess for preprocessing...")
+        print("\nRunning preprocessing subprocess...")
         cmd = ["python", "preprocess.py"]
         if config_name:
             cmd.extend(["--config", config_name])
-        
+
         try:
             subprocess.run(cmd, check=True, capture_output=True, text=True)
-            print("Subprocess finished successfully.")
-        except FileNotFoundError:
-            print("Error: 'python' command not found. Ensure Python is in your PATH.")
-            sys.exit(1)
+            print("Preprocessing finished successfully.")
         except subprocess.CalledProcessError as e:
-            print(f"--- Preprocessing Subprocess Failed ---")
+            print("--- Preprocessing Subprocess Failed ---")
             print(f"Command: {' '.join(e.cmd)}")
             print(f"Return Code: {e.returncode}")
             print(f"Output:\n{e.stdout}")
@@ -247,7 +188,7 @@ def run_preprocessing_if_needed(config, config_name):
 
 
 def create_dataset_and_dataloader(preprocess_dir, train_params):
-    """Create dataset and dataloader."""
+    """Build a PyTorch Dataset + DataLoader from preprocessed files."""
     try:
         dataset = Dataset(preprocess_dir)
         if len(dataset) == 0:
@@ -255,153 +196,122 @@ def create_dataset_and_dataloader(preprocess_dir, train_params):
             sys.exit(1)
 
         dataloader = torch.utils.data.DataLoader(
-            dataset, 
-            train_params['batch_size'], 
-            shuffle=True, 
+            dataset,
+            train_params['batch_size'],
+            shuffle=True,
             drop_last=True,
             num_workers=train_params['num_workers'],
             pin_memory=train_params['pin_memory'] if torch.cuda.is_available() else False,
-            persistent_workers=True if train_params['num_workers'] > 0 else False
+            persistent_workers=train_params['num_workers'] > 0,
         )
-        
+
         print(f"\nDataset loaded from {preprocess_dir} ({len(dataset)} samples).")
         return dataset, dataloader
 
     except FileNotFoundError:
         print(f"Error: Could not load preprocessed files from {preprocess_dir}")
         sys.exit(1)
-    except Exception as e:
-        print(f"Error creating Dataset or DataLoader: {e}")
-        sys.exit(1)
 
 
-def setup_logging(run_dir, svl_active, hrl_active):
-    """Initialize logging systems."""
-    writer = None
-    loss_log_path = None
-    
+def setup_logging(run_dir, hrl_active):
+    """Open a TensorBoard writer and a CSV loss log."""
     try:
         writer = SummaryWriter(run_dir, flush_secs=20)
         loss_log_path = path.join(run_dir, "loss_log.txt")
-        
-        loss_header_parts = ["step", "total_loss", "spectral_loss", "forward_ms", "backward_ms", "total_ms"]
-        if svl_active:
-            loss_header_parts.append("svl_loss")
+
+        loss_header = ["step", "total_loss", "spectral_loss", "forward_ms", "backward_ms", "total_ms"]
         if hrl_active:
-            loss_header_parts.append("hrl_loss")
-        
-        loss_header = ",".join(loss_header_parts) + "\n"
+            loss_header.append("hrl_loss")
+
         with open(loss_log_path, "w") as f:
-            f.write(loss_header)
-            
+            f.write(",".join(loss_header) + "\n")
+
         print(f"Logging initialized (TensorBoard: {run_dir}, File: {loss_log_path})")
         return writer, loss_log_path
-    
+
     except Exception as e:
         print(f"Warning: Failed to initialize logging: {e}")
         return None, None
 
 
 def setup_optimizer_and_scheduler(model, train_params):
-    """Setup optimizer and learning rate scheduler."""
+    """Adam optimizer + TF-style exponential decay scheduler."""
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    
     if not trainable_params:
         print("Warning: No trainable parameters found in model!")
-    
+
     optimizer = torch.optim.Adam(trainable_params, lr=train_params['initial_lr'])
-    
     scheduler = get_tensorflow_scheduler(
-        optimizer=optimizer,
+        optimizer,
         initial_lr=train_params['initial_lr'],
         decay_steps=train_params['decay_steps'],
         decay_rate=train_params['decay_rate'],
-        staircase=train_params['staircase']
+        staircase=train_params['staircase'],
     )
-    
     return optimizer, scheduler, trainable_params
 
 
-def calculate_loss(mssl, svl, hrl, model_outputs, target_signal, pitch, loudness,
-                  svl_active, hrl_active, svl_threshold, recent_mssl_avg):
-    """Calculate total loss from all components."""
+def calculate_loss(mssl, hrl, model_outputs, target_signal, pitch, loudness, hrl_active):
+    """Compute MSSL + (optionally) HRL."""
     predicted_signal = model_outputs['signal'].squeeze(-1)
     target_for_loss = target_signal.squeeze(-1) if target_signal.dim() > 2 else target_signal
 
     spectral_loss = mssl(predicted_signal, target_for_loss)
     total_loss = spectral_loss
 
-    variance_loss_value = None
     hrl_loss_value = None
-    svl_applied = False
     hrl_applied = False
 
-    if svl_active and model_outputs.get('harmonic_amplitudes') is not None and recent_mssl_avg < svl_threshold:
-        variance_loss_component = svl(model_outputs['harmonic_amplitudes'], pitch, loudness)
-        variance_loss_value = variance_loss_component.item() if isinstance(variance_loss_component, torch.Tensor) else float(variance_loss_component)
-        total_loss = total_loss + variance_loss_component
-        svl_applied = True
-
     if hrl_active and model_outputs.get('violin_diagnostics') is not None:
-        hrl_component = hrl(
-            model_outputs['violin_diagnostics'],
-            f0_hz=pitch,
-            loudness=loudness
-        )
+        hrl_component = hrl(model_outputs['violin_diagnostics'], f0_hz=pitch, loudness=loudness)
         hrl_loss_value = hrl_component.item() if isinstance(hrl_component, torch.Tensor) else float(hrl_component)
         total_loss = total_loss + hrl_component
         hrl_applied = True
 
-    return total_loss, spectral_loss, variance_loss_value, hrl_loss_value, svl_applied, hrl_applied
+    return total_loss, spectral_loss, hrl_loss_value, hrl_applied
 
 
 def log_training_metrics(writer, loss_log_path, global_step, total_loss_value, spectral_loss_value,
-                        forward_time, backward_time, total_time, variance_loss_value,
-                        hrl_loss_value, svl_active, hrl_active):
-    """Log metrics to TensorBoard and CSV file."""
+                         forward_time, backward_time, total_time, hrl_loss_value, hrl_active):
+    """Log per-step metrics to TensorBoard and a CSV file."""
     try:
         if writer:
             log_training_step(
                 writer, global_step, total_loss_value, spectral_loss_value,
-                forward_time, backward_time, total_time,
-                variance_loss_value, hrl_loss_value
+                forward_time, backward_time, total_time, hrl_loss_value,
             )
 
         if loss_log_path:
             log_items = [
                 f"{global_step}", f"{total_loss_value:.6f}", f"{spectral_loss_value:.6f}",
-                f"{forward_time*1000:.2f}", f"{backward_time*1000:.2f}", f"{total_time*1000:.2f}"
+                f"{forward_time*1000:.2f}", f"{backward_time*1000:.2f}", f"{total_time*1000:.2f}",
             ]
-            if svl_active:
-                log_items.append(f"{variance_loss_value if variance_loss_value is not None else 0.0:.6f}")
             if hrl_active:
                 log_items.append(f"{hrl_loss_value if hrl_loss_value is not None else 0.0:.6f}")
-            
-            log_line = ",".join(log_items) + "\n"
+
             with open(loss_log_path, "a") as log_f:
-                log_f.write(log_line)
-                
+                log_f.write(",".join(log_items) + "\n")
+
     except Exception as e:
         print(f"\nError during logging at step {global_step}: {e}")
 
 
 def save_final_results(model, run_dir, config, dataloader, device, train_params, global_step):
-    """Save final model state and evaluation audio."""
+    """Save final model checkpoint and evaluation audio."""
     try:
         torch.save(model.state_dict(), path.join(run_dir, "final_state.pth"))
         print("Saving final evaluation audio...")
         save_evaluation_audio(
             model, model.state_dict(), run_dir, config,
             dataloader, device, "final",
-            num_batches=train_params['save_audio_num_comparisons']
+            num_batches=train_params['save_audio_num_comparisons'],
         )
     except Exception as e:
         print(f"Error saving final state/audio: {e}")
 
 
-def print_training_info(config: dict, device: torch.device, steps: int, batch_size: int, 
-                       epochs: int, dataset_size: int, dataloader_size: int):
-    """Prints a summary of the key training configuration settings."""
+def print_training_info(config, device, steps, batch_size, epochs, dataset_size, dataloader_size):
+    """Print a one-shot summary of the training configuration."""
     train_config = config.get("train", {})
     model_config = config.get("model", {})
     loss_config = config.get("loss", {})
@@ -418,9 +328,9 @@ def print_training_info(config: dict, device: torch.device, steps: int, batch_si
     print(f"- Steps/Epoch: {dataloader_size:,}")
 
     print("\n--- Audio Settings ---")
-    print(f"- Sampling Rate: {model_config.get('sampling_rate', train_config.get('sampling_rate', 'N/A'))} Hz")
-    print(f"- Signal Length: {model_config.get('signal_length', train_config.get('signal_length', 'N/A'))} samples")
-    print(f"- Block Size: {model_config.get('block_size', train_config.get('block_size', 'N/A'))} samples")
+    print(f"- Sampling Rate: {model_config.get('sampling_rate', 'N/A')} Hz")
+    print(f"- Signal Length: {model_config.get('signal_length', 'N/A')} samples")
+    print(f"- Block Size: {model_config.get('block_size', 'N/A')} samples")
 
     print("\n--- Learning Rate Schedule ---")
     print(f"- Scheduler: TensorFlow Exponential Decay")
@@ -431,20 +341,13 @@ def print_training_info(config: dict, device: torch.device, steps: int, batch_si
 
     print("\n--- Loss Configuration ---")
     use_violin = bool(violin_model_config.get('use_helmholtz_synthesis', False))
-    use_svl_config = bool(loss_config.get('use_source_variance', False))
-    svl_active = use_svl_config and not use_violin
     hrl_weight = float(violin_loss_config.get("weight", 0.0))
-    use_hrl_config_toggle = bool(loss_config.get("use_helmholtz_deviation_loss", True))
-    hrl_active = use_violin and use_hrl_config_toggle and hrl_weight > 0
+    use_hrl_toggle = bool(loss_config.get("use_hrl", False))
+    hrl_active = use_violin and use_hrl_toggle and hrl_weight > 0
 
     print(f"- Multi-Scale STFT Loss: Enabled")
     print(f"  - Scales: {loss_config.get('mssl', {}).get('scales', 'N/A')}")
     print(f"  - Overlap: {loss_config.get('mssl', {}).get('overlap', 'N/A')}")
-    
-    print(f"- Source Variance Loss: {'Enabled' if svl_active else 'Disabled'}")
-    if svl_active:
-        print(f"  - Weight: {loss_config.get('source_variance', {}).get('weight', 'N/A')}")
-        print(f"  - Activation Threshold (MSSL): {train_config.get('svl_activation_threshold', 'N/A')}")
 
     print(f"- Harmonic Residual Loss (HRL): {'Enabled' if hrl_active else 'Disabled'}")
     if hrl_active:
@@ -453,28 +356,26 @@ def print_training_info(config: dict, device: torch.device, steps: int, batch_si
     print("-----------------------------")
 
 
-def save_evaluation_audio(model: nn.Module, model_state: dict, run_dir: str, config: dict,
-                          dataloader: torch.utils.data.DataLoader, device: torch.device,
-                          prefix: str, num_batches: int = 1):
-    """Generates and saves evaluation audio with beep separators between original/synthesized pairs."""
+def save_evaluation_audio(model, model_state, run_dir, config, dataloader, device,
+                          prefix, num_batches=1):
+    """Render `num_batches` (original, beep, synthesized) triples to a single WAV file."""
     original_training_state = model.training
-    
+
     if model_state:
         model.load_state_dict(model_state)
     model.eval()
 
     model_config = config.get("model", {})
     encoder_config = model_config.get("encoder", {})
-    train_config = config.get("train", {})
 
-    sampling_rate = int(model_config.get('sampling_rate', train_config.get('sampling_rate', 16000)))
+    sampling_rate = int(model_config.get('sampling_rate', 16000))
     beep_duration = 0.1
     beep_frequency = 1000
     beep_amplitude = 0.5
-    
-    time_beep = torch.linspace(0, beep_duration, int(beep_duration * float(sampling_rate)), dtype=torch.float32, device='cpu')
-    beep_signal = beep_amplitude * torch.sin(2 * math.pi * beep_frequency * time_beep)
-    beep_signal_np = beep_signal.numpy()
+
+    time_beep = torch.linspace(0, beep_duration, int(beep_duration * sampling_rate),
+                               dtype=torch.float32, device='cpu')
+    beep_signal_np = (beep_amplitude * torch.sin(2 * math.pi * beep_frequency * time_beep)).numpy()
 
     audio_parts = []
 
@@ -501,24 +402,20 @@ def save_evaluation_audio(model: nn.Module, model_state: dict, run_dir: str, con
                 synthesized_signal = model_outputs['signal']
 
                 if synthesized_signal is None:
-                    print(f"Warning: Model output signal is None for pair {i+1}, skipping.")
                     continue
 
                 original_segment = signals[0].cpu().numpy()
                 synthesized_segment = synthesized_signal[0].squeeze(-1).cpu().numpy()
 
                 min_length = min(len(original_segment), len(synthesized_segment))
+                if min_length == 0:
+                    continue
                 original_segment = original_segment[:min_length]
                 synthesized_segment = synthesized_segment[:min_length]
-                
-                if min_length == 0:
-                    print(f"Warning: Empty segment for pair {i+1}, skipping.")
-                    continue
 
                 audio_parts.append(original_segment)
                 audio_parts.append(beep_signal_np)
                 audio_parts.append(synthesized_segment)
-
                 if i < num_batches - 1:
                     audio_parts.append(beep_signal_np)
 
@@ -538,8 +435,8 @@ def save_evaluation_audio(model: nn.Module, model_state: dict, run_dir: str, con
             model.eval()
 
 
-def setup_data_pipeline(config: dict):
-    """Determine dataset paths and check if preprocessed data exists."""
+def setup_data_pipeline(config):
+    """Resolve dataset/preprocessing paths and check for cached preprocessed files."""
     if 'data' not in config:
         config['data'] = {}
     if 'preprocess' not in config:
@@ -549,24 +446,20 @@ def setup_data_pipeline(config: dict):
 
     train_cfg = config['train']
     data_cfg = config['data']
-    prep_cfg  = config['preprocess']
+    prep_cfg = config['preprocess']
 
     root = str(train_cfg.get("preprocessed_data_dir", "preprocessed"))
     dataset_tag = data_cfg.get("dataset_name")
-
     data_location = data_cfg.get("data_location")
     if dataset_tag is None and data_location:
         try:
-            after_dataset = data_location.split("dataset/")[1]
-            dataset_tag = after_dataset.strip("/\\")
+            dataset_tag = data_location.split("dataset/")[1].strip("/\\")
         except Exception:
             pass
-
     if dataset_tag is None:
         dataset_tag = "default_dataset"
 
     preprocess_dir = path.join(root, dataset_tag)
-
     prep_cfg["out_dir"] = preprocess_dir
     data_cfg["data_location"] = data_cfg.get("data_location", f"dataset/{dataset_tag}")
     data_cfg["extension"] = data_cfg.get("extension", "wav")
@@ -578,36 +471,25 @@ def setup_data_pipeline(config: dict):
         print(f"\nPreprocessed files not found in {preprocess_dir}")
         makedirs(preprocess_dir, exist_ok=True)
         return preprocess_dir, False
-    else:
-        print(f"\nUsing existing preprocessed files from {preprocess_dir}")
-        return preprocess_dir, True
+    print(f"\nUsing existing preprocessed files from {preprocess_dir}")
+    return preprocess_dir, True
 
 
-
-def log_training_step(writer: SummaryWriter, step: int, total_loss: float, spectral_loss: float,
-                     forward_time: float, backward_time: float, total_time: float,
-                     variance_loss_value: float | None = None,
-                     hrl_loss_value: float | None = None):
-    """Logs training metrics for a single step to TensorBoard."""
+def log_training_step(writer, step, total_loss, spectral_loss, forward_time,
+                      backward_time, total_time, hrl_loss_value=None):
+    """Log a single training step to TensorBoard."""
     writer.add_scalar("Loss/Total", total_loss, step)
     writer.add_scalar("Loss/Spectral", spectral_loss, step)
-
-    if variance_loss_value is not None:
-        writer.add_scalar("Loss/SVL", variance_loss_value, step)
-
     if hrl_loss_value is not None:
         writer.add_scalar("Loss/HRL", hrl_loss_value, step)
-
     writer.add_scalar("Time/Forward_ms", forward_time * 1000, step)
     writer.add_scalar("Time/Backward_ms", backward_time * 1000, step)
     writer.add_scalar("Time/Total_ms", total_time * 1000, step)
 
 
-def format_progress_dict(epoch: int, spectral_loss_val: float, total_loss_val: float,
-                         avg_mssl_loss: float, learning_rate: float,
-                         variance_loss_value: float | None = None,
-                         hrl_loss_value: float | None = None) -> dict:
-    """Creates a dictionary for displaying progress in the tqdm progress bar."""
+def format_progress_dict(epoch, spectral_loss_val, total_loss_val, avg_mssl_loss,
+                         learning_rate, hrl_loss_value=None):
+    """Build the tqdm postfix dict for one training step."""
     progress_dict = {
         'Epoch': epoch + 1,
         'MSSL': f'{spectral_loss_val:.4f}',
@@ -615,11 +497,6 @@ def format_progress_dict(epoch: int, spectral_loss_val: float, total_loss_val: f
         'AvgMSSL': f'{avg_mssl_loss:.4f}',
         'LR': f'{learning_rate:.2e}',
     }
-
-    if variance_loss_value is not None:
-        progress_dict['SVL'] = f'{variance_loss_value:.4f}'
-
     if hrl_loss_value is not None:
         progress_dict['HRL'] = f'{hrl_loss_value:.4f}'
-
     return progress_dict
