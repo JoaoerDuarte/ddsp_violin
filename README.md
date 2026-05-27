@@ -6,7 +6,7 @@ A physically-informed DDSP framework for bowed-string synthesis. Constrains the 
 
 ## Audio examples
 
-Listen at [joaoerduarte.github.io/ddsp_violin](https://joaoerduarte.github.io/ddsp_violin/).
+Listen at [joaoerduarte.github.io/DDSP-Violin-EUSIPCO2026](https://joaoerduarte.github.io/DDSP-Violin-EUSIPCO2026/).
 
 ## Setup
 
